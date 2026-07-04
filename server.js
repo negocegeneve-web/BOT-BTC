@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-//  server.js — Proxy Binance Futures (Railway) — v3.2 "Champion"
+//  server.js — Proxy Binance Futures (Railway) — v3.3 "Champion"
 //  Transport transplanté du serveur 3.13-Champion (qui trade avec
 //  succès sur le même demo-fapi, depuis le même Railway EU West) :
 //   1. KEEP-WARM 3s  : le pool undici ferme les connexions après ~4s
@@ -13,13 +13,29 @@
 //   6. GET /api/diag : IP/pays de sortie, horloge, lecture, écriture.
 //  Clés du diag : variables Railway BN_TEST_KEY / BN_TEST_SECRET.
 //
-//  ─── CHANGEMENTS v3.2 (uniquement /api/diag, trading INCHANGE) ───
+//  ─── CHANGEMENTS v3.2 (uniquement /api/diag) ───
 //   A. /api/diag accepte ?mode=mainnet|testnet (défaut: mainnet).
-//      Avant, le diag testait TOUJOURS le testnet en dur : avec des
-//      clés mainnet dans BN_TEST_KEY, cela renvoyait -2015 à tort.
-//   B. Lecture d'IP de sortie fiabilisée : api.ipify.org en premier
-//      (ipapi.co/ifconfig.co timeoutaient → champ "sortie" vide).
+//   B. Lecture d'IP de sortie fiabilisée : api.ipify.org en premier.
 //   C. Le diag indique quel 'base' (serveur) a réellement été testé.
+//
+//  ─── CHANGEMENTS v3.3 (PLOMBERIE D'EXÉCUTION — stratégie INCHANGÉE) ───
+//   D. CORRECTIF -1102 : placeConditional() ajoute algoType:'CONDITIONAL',
+//      paramètre obligatoire de /fapi/v1/algoOrder (doc Binance). Sans lui,
+//      les STOP_MARKET/TAKE_PROFIT_MARKET étaient rejetés → stops non posés.
+//   E. CORRECTIF -2022 : nouvelle fonction getRealPosition() lit la position
+//      RÉELLE via GET /fapi/v2/positionRisk (champ positionAmt) AVANT toute
+//      fermeture. Toute requête reduceOnly/closePosition est réconciliée
+//      avec Binance = source de vérité :
+//        • si Binance montre 0 → la fermeture est ANNULÉE proprement
+//          (renvoie {code:0, reconciled:true}), plus de -2022 sur fantôme ;
+//        • si la quantité demandée > quantité réelle → elle est PLAFONNÉE
+//          à la quantité réelle (on ne ferme jamais plus qu'il n'existe).
+//      Détection d'une fermeture : reduceOnly=true OU closePosition=true,
+//      OU un ordre MARKET dont le side est opposé à la position ouverte.
+//   F. Le sizing d'OUVERTURE n'est PAS touché : la PWA envoie sa quantité,
+//      le proxy la transmet telle quelle. On ne réconcilie qu'à la fermeture,
+//      là où la divergence PWA/Binance est dangereuse.
+//   Aucune touche à : cadence, seuils Q, mises, levier, EMA, SL/TP %.
 // ═══════════════════════════════════════════════════════════════
 
 const express = require('express');
@@ -89,10 +105,39 @@ async function orderExists(base, symbol, clientId, apiKey, apiSecret) {
   return (check && check.orderId) ? check : null;
 }
 
+// ══ E. RÉCONCILIATION — Binance = source de vérité (correctif -2022) ══
+// Lit la position RÉELLE d'un symbole via /fapi/v2/positionRisk.
+// Retourne { amt, side } : amt = |positionAmt| (>=0), side = 'BUY'|'SELL'|null.
+//  - positionAmt > 0  → position LONG   (se ferme par un SELL)
+//  - positionAmt < 0  → position SHORT  (se ferme par un BUY)
+//  - positionAmt = 0  → aucune position réelle
+async function getRealPosition(base, symbol, apiKey, apiSecret) {
+  const r = await bnCall(base, '/fapi/v2/positionRisk', 'GET', { symbol }, apiKey, apiSecret);
+  if (!Array.isArray(r)) return { amt: 0, side: null, raw: r }; // erreur : on renvoie 0 (prudent)
+  const row = r.find(p => p && p.symbol === symbol) || r[0];
+  if (!row) return { amt: 0, side: null };
+  const net = parseFloat(row.positionAmt || '0');
+  if (!isFinite(net) || net === 0) return { amt: 0, side: null };
+  return { amt: Math.abs(net), side: net > 0 ? 'SELL' : 'BUY', net };
+}
+
+// Détermine si une requête d'ordre est une FERMETURE (à réconcilier).
+function isCloseRequest(path, params, realSide) {
+  if (!path.includes('/order')) return false;
+  const ro = params.reduceOnly === true || params.reduceOnly === 'true';
+  const cp = params.closePosition === true || params.closePosition === 'true';
+  if (ro || cp) return true;
+  // Ordre MARKET dont le side ferme la position réelle (ex : position LONG → SELL MARKET)
+  if ((params.type === 'MARKET') && realSide && params.side === realSide) return true;
+  return false;
+}
+
 // ══ 4. SL/TP conditionnels → service ALGO (migration 09/12/2025), repli ancien ══
 // Structure copiée de placeExchangeStops du Champion.
+// v3.3 : ajout algoType:'CONDITIONAL' (obligatoire, correctif -1102).
 async function placeConditional(base, params, apiKey, apiSecret) {
   const algoParams = {
+    algoType: 'CONDITIONAL',                                   // ← v3.3 OBLIGATOIRE (correctif -1102)
     symbol: params.symbol,
     side: params.side,
     orderType: params.type,                                   // STOP_MARKET | TAKE_PROFIT_MARKET
@@ -118,8 +163,8 @@ async function placeConditional(base, params, apiKey, apiSecret) {
 }
 
 // ── Health ──
-app.get('/', (req, res) => res.status(200).json({ ok: true, service: 'Itachi Proxy Binance', version: 'v3.2-per-trade-stops', clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag'] }));
-app.get('/api/binance', (req, res) => res.status(200).json({ ok: true, msg: 'Proxy Railway vivant (v3.2 : stops par trade + keep-warm + horloge + algo + reprise -1007)', clockOffsetMs: Math.round(TIME_OFFSET), modes: Object.keys(BN_BASES) }));
+app.get('/', (req, res) => res.status(200).json({ ok: true, service: 'Itachi Proxy Binance', version: 'v3.3-reconcile-close', clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag'] }));
+app.get('/api/binance', (req, res) => res.status(200).json({ ok: true, msg: 'Proxy Railway vivant (v3.3 : stops par trade + algoType + reconciliation fermeture + keep-warm + horloge + reprise -1007)', clockOffsetMs: Math.round(TIME_OFFSET), modes: Object.keys(BN_BASES) }));
 
 // ══ 6. DIAGNOSTIC ══
 // v3.2 : ?mode=mainnet (défaut) ou ?mode=testnet. Le diag teste le
@@ -127,7 +172,7 @@ app.get('/api/binance', (req, res) => res.status(200).json({ ok: true, msg: 'Pro
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v3.2-per-trade-stops', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v3.3-reconcile-close', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -188,16 +233,42 @@ app.post('/api/binance', async (req, res) => {
     let data;
 
     if (isConditional) {
-      // ── SL/TP : route ALGO (correctif -4120) avec repli ──
+      // ── SL/TP : route ALGO (correctif -4120 + algoType -1102) avec repli ──
       data = await placeConditional(base, params, apiKey, apiSecret);
-    } else {
-      if (isOrder && !params.newClientOrderId) params.newClientOrderId = 'itachi' + Date.now() + Math.floor(Math.random() * 1000);
+    } else if (isOrder) {
+      // ══ E. RÉCONCILIATION AVANT FERMETURE (correctif -2022) ══
+      // On lit la position réelle. Si la requête est une fermeture, on la
+      // confronte à Binance : annulée si rien à fermer, plafonnée sinon.
+      let real = { amt: 0, side: null };
+      if (params.symbol) real = await getRealPosition(base, params.symbol, apiKey, apiSecret);
+
+      if (isCloseRequest(path, params, real.side)) {
+        if (real.amt === 0) {
+          // Rien à fermer côté Binance → on n'envoie PAS l'ordre (évite -2022)
+          console.log(`[FERMETURE ANNULEE] ${params.symbol} : aucune position reelle chez Binance (source de verite).`);
+          return res.status(200).json({ code: 0, reconciled: true, msg: 'Aucune position reelle a fermer (reconcilie avec Binance).', requested: params.quantity });
+        }
+        // Plafonne la quantité fermée à la quantité réellement ouverte
+        if (params.quantity != null && params.quantity !== '') {
+          const q = parseFloat(params.quantity);
+          if (isFinite(q) && q > real.amt) {
+            console.log(`[FERMETURE PLAFONNEE] ${params.symbol} : demande ${q} > reel ${real.amt} → ferme ${real.amt}.`);
+            params.quantity = String(real.amt);
+          }
+        }
+        // Sécurité : une fermeture doit être reduceOnly (jamais ouvrir l'opposé)
+        if (!(params.closePosition === true || params.closePosition === 'true')) {
+          params.reduceOnly = 'true';
+        }
+      }
+
+      if (!params.newClientOrderId) params.newClientOrderId = 'itachi' + Date.now() + Math.floor(Math.random() * 1000);
       const id1 = params.newClientOrderId;
 
       data = await bnCall(base, path, method, params, apiKey, apiSecret);
 
       // ── Reprise -1007 : Binance = source de vérité ──
-      if (isOrder && data && data.code === -1007) {
+      if (data && data.code === -1007) {
         await sleep(2500);
         const found1 = await orderExists(base, params.symbol, id1, apiKey, apiSecret);
         if (found1) data = { ...found1, recovered: true };
@@ -213,10 +284,14 @@ app.post('/api/binance', async (req, res) => {
           } else data = retry;
         }
       }
+    } else {
+      // Requête non-ordre (lecture) : transmise telle quelle
+      data = await bnCall(base, path, method, params, apiKey, apiSecret);
     }
 
     if (isOrder) {
       if (data && data.orderId) console.log(`[ORDER OK] ${params.symbol} ${params.side} ${params.type} → #${data.orderId}${data.algo ? ' (algo)' : ''}${data.recovered ? ' (recovered)' : ''}${data.retried ? ' (retried)' : ''}`);
+      else if (data && data.reconciled) { /* déjà loggé */ }
       else console.log(`[ORDER FAIL] ${params.symbol} ${params.side} ${params.type} → ${JSON.stringify(data).slice(0, 400)}`);
     }
 
@@ -230,4 +305,4 @@ app.post('/api/binance', async (req, res) => {
 syncTimeAndWarm();
 setInterval(syncTimeAndWarm, 3000);
 
-app.listen(PORT, () => console.log(`Proxy Binance v3.2 (stops par trade) en ecoute sur le port ${PORT}`));
+app.listen(PORT, () => console.log(`Proxy Binance v3.3 (reconciliation fermeture) en ecoute sur le port ${PORT}`));
