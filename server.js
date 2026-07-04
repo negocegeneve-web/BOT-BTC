@@ -89,10 +89,16 @@ async function placeConditional(base, params, apiKey, apiSecret) {
     side: params.side,
     orderType: params.type,                                   // STOP_MARKET | TAKE_PROFIT_MARKET
     triggerPrice: params.stopPrice,
-    closePosition: params.closePosition || 'true',
     workingType: params.workingType || 'MARK_PRICE',
     timeInForce: params.timeInForce || 'GTE_GTC',
   };
+  // Stops PAR TRADE : si une quantité est fournie, le stop ne ferme que SA part
+  if (params.quantity != null && params.quantity !== '') {
+    algoParams.quantity   = params.quantity;
+    algoParams.reduceOnly = params.reduceOnly || 'true';
+  } else {
+    algoParams.closePosition = params.closePosition || 'true';
+  }
   const a = await bnCall(base, '/fapi/v1/algoOrder', 'POST', algoParams, apiKey, apiSecret);
   if (a && (a.algoId || a.orderId || a.clientAlgoId)) {
     return { orderId: a.algoId || a.orderId, algo: true, ...a };
@@ -104,12 +110,12 @@ async function placeConditional(base, params, apiKey, apiSecret) {
 }
 
 // ── Health ──
-app.get('/', (req, res) => res.status(200).json({ ok: true, service: 'Itachi Proxy Binance', version: 'v3-champion-transport', clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag'] }));
-app.get('/api/binance', (req, res) => res.status(200).json({ ok: true, msg: 'Proxy Railway vivant (v3 Champion : keep-warm + horloge + algo SL/TP + reprise -1007)', clockOffsetMs: Math.round(TIME_OFFSET), modes: Object.keys(BN_BASES) }));
+app.get('/', (req, res) => res.status(200).json({ ok: true, service: 'Itachi Proxy Binance', version: 'v3.1-per-trade-stops', clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag'] }));
+app.get('/api/binance', (req, res) => res.status(200).json({ ok: true, msg: 'Proxy Railway vivant (v3.1 : stops par trade + keep-warm + horloge + algo + reprise -1007)', clockOffsetMs: Math.round(TIME_OFFSET), modes: Object.keys(BN_BASES) }));
 
 // ══ 6. DIAGNOSTIC ══
 app.get('/api/diag', async (req, res) => {
-  const out = { version: 'v3-champion-transport', date: new Date().toISOString(), clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v3.1-per-trade-stops', date: new Date().toISOString(), clockOffsetMs: Math.round(TIME_OFFSET) };
   const base = BN_BASES.testnet;
 
   try {
@@ -206,4 +212,4 @@ app.post('/api/binance', async (req, res) => {
 syncTimeAndWarm();
 setInterval(syncTimeAndWarm, 3000);
 
-app.listen(PORT, () => console.log(`Proxy Binance v3 Champion (keep-warm 3s + horloge + algo) en ecoute sur le port ${PORT}`));
+app.listen(PORT, () => console.log(`Proxy Binance v3.1 (stops par trade) en ecoute sur le port ${PORT}`));
