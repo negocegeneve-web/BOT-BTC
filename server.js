@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-//  server.js — Proxy Binance Futures (Railway) — v3 "Champion"
+//  server.js — Proxy Binance Futures (Railway) — v3.2 "Champion"
 //  Transport transplanté du serveur 3.13-Champion (qui trade avec
 //  succès sur le même demo-fapi, depuis le même Railway EU West) :
 //   1. KEEP-WARM 3s  : le pool undici ferme les connexions après ~4s
@@ -12,6 +12,14 @@
 //   5. Reprise -1007 conservée (vérif par identifiant client).
 //   6. GET /api/diag : IP/pays de sortie, horloge, lecture, écriture.
 //  Clés du diag : variables Railway BN_TEST_KEY / BN_TEST_SECRET.
+//
+//  ─── CHANGEMENTS v3.2 (uniquement /api/diag, trading INCHANGE) ───
+//   A. /api/diag accepte ?mode=mainnet|testnet (défaut: mainnet).
+//      Avant, le diag testait TOUJOURS le testnet en dur : avec des
+//      clés mainnet dans BN_TEST_KEY, cela renvoyait -2015 à tort.
+//   B. Lecture d'IP de sortie fiabilisée : api.ipify.org en premier
+//      (ipapi.co/ifconfig.co timeoutaient → champ "sortie" vide).
+//   C. Le diag indique quel 'base' (serveur) a réellement été testé.
 // ═══════════════════════════════════════════════════════════════
 
 const express = require('express');
@@ -110,23 +118,31 @@ async function placeConditional(base, params, apiKey, apiSecret) {
 }
 
 // ── Health ──
-app.get('/', (req, res) => res.status(200).json({ ok: true, service: 'Itachi Proxy Binance', version: 'v3.1-per-trade-stops', clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag'] }));
-app.get('/api/binance', (req, res) => res.status(200).json({ ok: true, msg: 'Proxy Railway vivant (v3.1 : stops par trade + keep-warm + horloge + algo + reprise -1007)', clockOffsetMs: Math.round(TIME_OFFSET), modes: Object.keys(BN_BASES) }));
+app.get('/', (req, res) => res.status(200).json({ ok: true, service: 'Itachi Proxy Binance', version: 'v3.2-per-trade-stops', clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag'] }));
+app.get('/api/binance', (req, res) => res.status(200).json({ ok: true, msg: 'Proxy Railway vivant (v3.2 : stops par trade + keep-warm + horloge + algo + reprise -1007)', clockOffsetMs: Math.round(TIME_OFFSET), modes: Object.keys(BN_BASES) }));
 
 // ══ 6. DIAGNOSTIC ══
+// v3.2 : ?mode=mainnet (défaut) ou ?mode=testnet. Le diag teste le
+// serveur correspondant aux clés présentes dans BN_TEST_KEY/SECRET.
 app.get('/api/diag', async (req, res) => {
-  const out = { version: 'v3.1-per-trade-stops', date: new Date().toISOString(), clockOffsetMs: Math.round(TIME_OFFSET) };
-  const base = BN_BASES.testnet;
+  const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
+  const base = BN_BASES[mode];
+  const out = { version: 'v3.2-per-trade-stops', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
+  // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
-    const r = await fetch('https://ipapi.co/json/', { signal: AbortSignal.timeout(6000) });
+    const r = await fetch('https://api.ipify.org?format=json', { signal: AbortSignal.timeout(6000) });
     const j = await r.json();
-    out.sortie = { ip: j.ip, pays: j.country_name, ville: j.city, org: j.org };
+    out.sortie = { ip: j.ip };
   } catch (e) {
     try { const r2 = await fetch('https://ifconfig.co/json', { signal: AbortSignal.timeout(6000) }); const j2 = await r2.json(); out.sortie = { ip: j2.ip, pays: j2.country }; }
-    catch (e2) { out.sortie = { erreur: e2.message }; }
+    catch (e2) {
+      try { const r3 = await fetch('https://ipapi.co/json/', { signal: AbortSignal.timeout(6000) }); const j3 = await r3.json(); out.sortie = { ip: j3.ip, pays: j3.country_name, ville: j3.city, org: j3.org }; }
+      catch (e3) { out.sortie = { erreur: e3.message }; }
+    }
   }
 
+  // ── Ping non signé du serveur testé ──
   { const t0 = Date.now();
     try { const r = await fetch(base + '/fapi/v1/time', { signal: AbortSignal.timeout(8000) }); const txt = await r.text();
       out.ping_binance = { httpStatus: r.status, ms: Date.now() - t0, extrait: txt.slice(0, 80) };
@@ -135,10 +151,12 @@ app.get('/api/diag', async (req, res) => {
   const apiKey = process.env.BN_TEST_KEY, apiSecret = process.env.BN_TEST_SECRET;
   if (!apiKey || !apiSecret) { out.lecture_signee = out.test_ecriture = 'Variables BN_TEST_KEY / BN_TEST_SECRET absentes sur Railway'; return res.status(200).json(out); }
 
+  // ── Lecture signée (solde) sur le serveur testé ──
   { const t0 = Date.now();
     const j = await bnCall(base, '/fapi/v2/balance', 'GET', {}, apiKey, apiSecret);
     out.lecture_signee = { ms: Date.now() - t0, verdict: Array.isArray(j) ? 'OK (' + j.length + ' actifs)' : ('code ' + j.code + ' — ' + (j.msg || '')), extrait: JSON.stringify(j).slice(0, 120) }; }
 
+  // ── Test écriture (rejet instantané attendu : quantité 0) ──
   { const t0 = Date.now();
     const j = await bnCall(base, '/fapi/v1/order', 'POST',
       { symbol: 'BTCUSDT', side: 'BUY', type: 'MARKET', quantity: 0, newClientOrderId: 'diag' + Date.now() },
@@ -212,4 +230,4 @@ app.post('/api/binance', async (req, res) => {
 syncTimeAndWarm();
 setInterval(syncTimeAndWarm, 3000);
 
-app.listen(PORT, () => console.log(`Proxy Binance v3.1 (stops par trade) en ecoute sur le port ${PORT}`));
+app.listen(PORT, () => console.log(`Proxy Binance v3.2 (stops par trade) en ecoute sur le port ${PORT}`));
