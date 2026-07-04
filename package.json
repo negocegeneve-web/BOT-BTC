@@ -1,0 +1,15 @@
+{
+  "name": "itachi-proxy-binance",
+  "version": "1.0.0",
+  "description": "Proxy Binance Futures pour Itachi PWA - signe HMAC cote serveur, resout le CORS",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
