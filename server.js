@@ -134,16 +134,20 @@ function isCloseRequest(path, params, realSide) {
 
 // ══ 4. SL/TP conditionnels → service ALGO (migration 09/12/2025), repli ancien ══
 // Structure copiée de placeExchangeStops du Champion.
-// v3.3 : ajout algoType:'CONDITIONAL' (obligatoire, correctif -1102).
+// v3.4 : correctifs -1102 CONFIRMÉS PAR LA DOC officielle /fapi/v1/algoOrder :
+//   • algoType:'CONDITIONAL' (obligatoire).
+//   • le type d'ordre s'envoie sous le nom 'type' (PAS 'orderType' ; orderType
+//     est le nom du champ dans la RÉPONSE, mais 'type' dans la REQUÊTE).
+//   • timeInForce doit valoir IOC|GTC|FOK|GTX ('GTE_GTC' était invalide) → GTC.
 async function placeConditional(base, params, apiKey, apiSecret) {
   const algoParams = {
-    algoType: 'CONDITIONAL',                                   // ← v3.3 OBLIGATOIRE (correctif -1102)
+    algoType: 'CONDITIONAL',                                   // obligatoire (doc)
     symbol: params.symbol,
     side: params.side,
-    orderType: params.type,                                   // STOP_MARKET | TAKE_PROFIT_MARKET
+    type: params.type,                                        // ← v3.4 'type' (correctif -1102) : STOP_MARKET | TAKE_PROFIT_MARKET
     triggerPrice: params.stopPrice,
     workingType: params.workingType || 'MARK_PRICE',
-    timeInForce: params.timeInForce || 'GTE_GTC',
+    timeInForce: params.timeInForce || 'GTC',                 // ← v3.4 GTC (valeur valide doc)
   };
   // Stops PAR TRADE : si une quantité est fournie, le stop ne ferme que SA part
   if (params.quantity != null && params.quantity !== '') {
@@ -163,8 +167,58 @@ async function placeConditional(base, params, apiKey, apiSecret) {
 }
 
 // ── Health ──
-app.get('/', (req, res) => res.status(200).json({ ok: true, service: 'Itachi Proxy Binance', version: 'v3.3-reconcile-close', clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag'] }));
-app.get('/api/binance', (req, res) => res.status(200).json({ ok: true, msg: 'Proxy Railway vivant (v3.3 : stops par trade + algoType + reconciliation fermeture + keep-warm + horloge + reprise -1007)', clockOffsetMs: Math.round(TIME_OFFSET), modes: Object.keys(BN_BASES) }));
+app.get('/', (req, res) => res.status(200).json({ ok: true, service: 'Itachi Proxy Binance', version: 'v3.4-type-fix-pnlreel', clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel'] }));
+app.get('/api/binance', (req, res) => res.status(200).json({ ok: true, msg: 'Proxy Railway vivant (v3.4 : stops corriges type + reconciliation fermeture + PnL reel/frais + keep-warm + horloge)', clockOffsetMs: Math.round(TIME_OFFSET), modes: Object.keys(BN_BASES) }));
+
+// ══ POINT 2 — P&L NET RÉEL + FRAIS depuis Binance (source de vérité comptable) ══
+// La PWA interroge cet endpoint (POST, clés dans headers comme /api/binance)
+// pour afficher le NET RÉEL à côté de sa simulation. Agrège /fapi/v1/income :
+//   • REALIZED_PNL  : profit/perte réalisé réel des trades fermés
+//   • COMMISSION    : frais Binance réels payés (négatifs)
+//   • FUNDING_FEE   : frais de financement perpétuel (peut être +/-)
+// net_reel = somme(REALIZED_PNL) + somme(COMMISSION) + somme(FUNDING_FEE).
+// Optionnel body: { symbol, startTime, limit }. Défaut: lignes récentes.
+app.post('/api/pnl-reel', async (req, res) => {
+  try {
+    const apiKey    = req.headers['x-api-key'];
+    const apiSecret = req.headers['x-api-secret'];
+    const mode      = req.headers['x-bn-mode'] === 'mainnet' ? 'mainnet' : 'testnet';
+    const base      = BN_BASES[mode];
+    if (!apiKey || !apiSecret) return res.status(200).json({ code: -2014, msg: 'Cles API manquantes dans les headers' });
+
+    const body = req.body || {};
+    const p = { limit: body.limit || 1000 };
+    if (body.symbol)    p.symbol = body.symbol;
+    if (body.startTime) p.startTime = body.startTime;
+
+    const rows = await bnCall(base, '/fapi/v1/income', 'GET', p, apiKey, apiSecret);
+    if (!Array.isArray(rows)) return res.status(200).json({ code: (rows && rows.code) || -1, msg: 'income non-array', raw: rows });
+
+    let realizedPnl = 0, commission = 0, funding = 0;
+    for (const r of rows) {
+      const v = parseFloat(r.income || '0');
+      if (!isFinite(v)) continue;
+      if (r.incomeType === 'REALIZED_PNL') realizedPnl += v;
+      else if (r.incomeType === 'COMMISSION') commission += v;
+      else if (r.incomeType === 'FUNDING_FEE') funding += v;
+    }
+    const round = x => Math.round(x * 1e8) / 1e8;
+    const net_reel = round(realizedPnl + commission + funding);
+
+    return res.status(200).json({
+      ok: true,
+      source: 'Binance /fapi/v1/income (verite comptable)',
+      mode,
+      realized_pnl: round(realizedPnl),   // gains/pertes bruts realises
+      frais_binance: round(commission),   // commissions reelles (negatif)
+      funding_fee: round(funding),        // financement perpetuel
+      net_reel,                           // ← LE net reel a afficher dans la PWA
+      lignes: rows.length
+    });
+  } catch (e) {
+    return res.status(200).json({ code: -1, msg: 'Proxy pnl-reel: ' + e.message });
+  }
+});
 
 // ══ 6. DIAGNOSTIC ══
 // v3.2 : ?mode=mainnet (défaut) ou ?mode=testnet. Le diag teste le
@@ -172,7 +226,7 @@ app.get('/api/binance', (req, res) => res.status(200).json({ ok: true, msg: 'Pro
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v3.3-reconcile-close', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v3.4-type-fix-pnlreel', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -305,4 +359,4 @@ app.post('/api/binance', async (req, res) => {
 syncTimeAndWarm();
 setInterval(syncTimeAndWarm, 3000);
 
-app.listen(PORT, () => console.log(`Proxy Binance v3.3 (reconciliation fermeture) en ecoute sur le port ${PORT}`));
+app.listen(PORT, () => console.log(`Proxy Binance v3.4 (type-fix + PnL reel) en ecoute sur le port ${PORT}`));
