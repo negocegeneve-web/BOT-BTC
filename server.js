@@ -1,5 +1,6 @@
 // ═══════════════════════════════════════════════════════════════
-//  server.js — Proxy Binance Futures (Railway) — v3.5 "Champion"
+//  server.js — Itachi BOT-BTC v6.0 « Srv 4.0 » — PROXY v3.5 + MOTEUR SERVEUR
+//  PARTIE 1/2 : transport & endpoints proxy v3.5 (INCHANGES, compatibilite PWA totale)
 //  Transport transplanté du serveur 3.13-Champion (qui trade avec
 //  succès sur le même demo-fapi, depuis le même Railway EU West) :
 //   1. KEEP-WARM 3s  : le pool undici ferme les connexions après ~4s
@@ -172,9 +173,8 @@ async function placeConditional(base, params, apiKey, apiSecret) {
   return { code: (a && a.code) || (b && b.code) || -1, msg: 'algo: ' + JSON.stringify(a).slice(0,120) + ' / classique: ' + JSON.stringify(b).slice(0,120) };
 }
 
-// ── Health ──
-app.get('/', (req, res) => res.status(200).json({ ok: true, service: 'Itachi Proxy Binance', version: 'v3.5-trailing-natif', clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel'] }));
-app.get('/api/binance', (req, res) => res.status(200).json({ ok: true, msg: 'Proxy Railway vivant (v3.5 : trailing natif + stops type + reconciliation fermeture + PnL reel + keep-warm)', clockOffsetMs: Math.round(TIME_OFFSET), modes: Object.keys(BN_BASES) }));
+// ── Health (le GET / est desormais le DASHBOARD, defini plus bas ; JSON -> /api/health) ──
+app.get('/api/binance', (req, res) => res.status(200).json({ ok: true, msg: 'Proxy Railway vivant (v6.0 : moteur serveur + trailing natif + stops type + reconciliation fermeture + PnL reel + keep-warm)', clockOffsetMs: Math.round(TIME_OFFSET), modes: Object.keys(BN_BASES) }));
 
 // ══ POINT 2 — P&L NET RÉEL + FRAIS depuis Binance (source de vérité comptable) ══
 // La PWA interroge cet endpoint (POST, clés dans headers comme /api/binance)
@@ -232,7 +232,7 @@ app.post('/api/pnl-reel', async (req, res) => {
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v3.5-trailing-natif', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v6.0-server-engine', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -361,8 +361,748 @@ app.post('/api/binance', async (req, res) => {
   }
 });
 
-// ══ Démarrage : synchro immédiate puis keep-warm toutes les 3s (recette Champion) ══
+// ══ Synchro horloge immédiate puis keep-warm toutes les 3s (recette Champion) ══
 syncTimeAndWarm();
 setInterval(syncTimeAndWarm, 3000);
 
-app.listen(PORT, () => console.log(`Proxy Binance v3.5 (trailing natif) en ecoute sur le port ${PORT}`));
+// ═══════════════════════════════════════════════════════════════
+//  PARTIE 2/2 — MOTEUR DE TRADING SERVEUR v6.0 « Srv 4.0 »
+//  Portage INTEGRAL du cerveau Itachi v5.1 REAL (PWA) vers Railway.
+//  Decrets appliques (tous anterieurs, AUCUN nouveau parametre) :
+//   • SL -0.8% fixe (STOP_MARKET natif, reduceOnly, par trade)
+//   • TREND : trailing NATIF Binance — armement +1.6%, callback -0.5%
+//   • RANGE : TP FIXE +0.7% (TAKE_PROFIT_MARKET natif)
+//   • Mises 50 / 67.50 / 87.50 $ selon Q — Leviers 3x / 7x / 12x
+//   • MIN_GAP 90s | MAX 2 positions meme sens | espacement 0.3%
+//   • Kill switch : perte session reelle >= 20% du capital ref (500$ → -100$)
+//   • Multi-regime ADX(14) Wilder sur 5m : UP=longs / DOWN=shorts /
+//     RANGE=mean-reversion 2 sens (Bollinger 20/2σ + RSI 14 sur 1m)
+//   • Decisions UNIQUEMENT sur clotures de bougies 1m officielles
+//   • Binance = source de verite : reconciliation 9s, adoption au boot
+//  Activation par variables Railway UNIQUEMENT (deploiement = no-op) :
+//   ENGINE_MODE = off (defaut) | paper | live
+//   BINANCE_API_KEY / BINANCE_API_SECRET (obligatoires en live)
+//   ENGINE_NET = mainnet (defaut) | testnet
+//   SYMBOL = BTCUSDT (defaut) | CAPITAL = 500 (defaut)
+// ═══════════════════════════════════════════════════════════════
+
+// ── CONFIGURATION MOTEUR (variables Railway) ──
+const ENGINE_MODE = (process.env.ENGINE_MODE || 'off').toLowerCase();   // off | paper | live
+const ENGINE_NET  = (process.env.ENGINE_NET  || 'mainnet').toLowerCase() === 'testnet' ? 'testnet' : 'mainnet';
+const E_KEY       = process.env.BINANCE_API_KEY    || '';
+const E_SECRET    = process.env.BINANCE_API_SECRET || '';
+const SYMBOL      = (process.env.SYMBOL || 'BTCUSDT').toUpperCase();
+const E_BASE      = BN_BASES[ENGINE_NET];
+const KLINE_BASE  = BN_BASES.mainnet;              // klines toujours mainnet (testnet = historique pauvre)
+
+// ── PARAMETRES STRATEGIQUES (decrets — IMMUABLES sans backtest/decret) ──
+const P = {
+  CAP: parseFloat(process.env.CAPITAL || '500'),
+  STAKE: 50, STAKE_MID: 67.5, STAKE_MAX: 87.5,
+  MAX_OP: 4,
+  LEV_LOW: 3, LEV_MED: 7, LEV_HIGH: 12,
+  SL: 0.008, TP: 0.016, TRAIL: 0.005, TP_RANGE: 0.007,
+  KILL: 0.20,
+  FEE_SIDE: 0.0005,            // taker mainnet 0.05% par cote (paper)
+  EMA_F: 8, EMA_S: 21
+};
+const MIN_GAP_MS    = 90 * 1000;   // decret v5.1 : 1min30 entre deux entrees
+const MAX_SAME_DIR  = 2;           // decret v5.1 : max 2 positions meme sens
+const ENTRY_SPACING = 0.003;       // decret v5.1 : espacement >= 0.3% entre entrees meme sens
+const ADX_PERIOD = 14, ADX_TREND = 20;
+const QTY_DEC = SYMBOL === 'BTCUSDT' ? 3 : 0;      // precision quantite
+const PX_DEC  = SYMBOL === 'BTCUSDT' ? 1 : 2;      // precision prix
+
+// ── ETAT MOTEUR ──
+const S = {
+  running: false, killed: false,
+  price: 0, priceChg24h: 0,
+  candles1m: [],               // clotures 1m {t,h,l,c} (max 240)
+  candles5m: [], cur5: null,   // bougies 5m {h,l,c} pour ADX
+  lastClosed1m: 0,             // openTime de la derniere 1m traitee
+  regime: 'WARMUP', adx: 0, pdi: 0, ndi: 0,
+  sigQ: 0, sigDir: 'NEUT', ef: 0, es: 0,
+  trades: [], closed: [],      // positions ouvertes / historique
+  lastEntry: 0,
+  walletStart: 0, walletNow: 0, unreal: 0, sessionPnl: 0,
+  netReel: null,               // { net, brut, frais, funding } via /fapi/v1/income
+  paperCap: parseFloat(process.env.CAPITAL || '500'),
+  startedAt: 0, ticks: 0, lastHb: 0,
+  levSet: 0,                   // dernier levier pousse a Binance (cache)
+  journal: []                  // { ts, type, msg } (max 400)
+};
+
+function jlog(type, msg) {
+  const e = { ts: Date.now(), type, msg };
+  S.journal.push(e);
+  if (S.journal.length > 400) S.journal.shift();
+  console.log(`[BOT ${type}] ${msg}`);
+  sseBroadcast({ kind: 'log', e });
+}
+
+// ═════════════ INDICATEURS (portage exact v5.1 — fonctions pures) ═════════════
+function calcEMA(prices, period) {
+  if (prices.length < period) return null;
+  const k = 2 / (period + 1);
+  let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < prices.length; i++) ema = prices[i] * k + ema * (1 - k);
+  return ema;
+}
+
+function calcSignal(prices) {
+  if (prices.length < P.EMA_F + 2) return { q: 0, dir: 'NEUT', ef: null, es: null, mom: 0 };
+  const ef = calcEMA(prices, Math.min(P.EMA_F, prices.length));
+  const es = prices.length >= P.EMA_S
+    ? calcEMA(prices, P.EMA_S)
+    : calcEMA(prices, Math.max(P.EMA_F + 1, Math.floor(prices.length * 0.7)));
+  const n = prices.length;
+  const lookback = Math.min(4, n - 1);
+  const mom = (prices[n-1] - prices[n-1-lookback]) / prices[n-1-lookback];
+  const momScore = Math.min(50, Math.abs(mom) * 50000);
+  const emaDiff  = Math.abs(ef - es) / es;
+  const emaScore = Math.min(30, emaDiff * 100000);
+  const aligned  = (ef > es && mom > 0) || (ef < es && mom < 0);
+  const q = Math.min(99, Math.round(momScore + emaScore + (aligned ? 20 : 0)));
+  let dir = 'NEUT';
+  if (mom > 0.00005 && ef >= es) dir = 'BULL';
+  else if (mom < -0.00005 && ef <= es) dir = 'BEAR';
+  return { q, dir, ef, es, mom };
+}
+
+// ADX de Wilder (New Concepts in Technical Trading Systems, 1978)
+function calcADX(c5, period) {
+  if (!c5 || c5.length < period * 2 + 2) return null;
+  const trs = [], pdms = [], ndms = [];
+  for (let i = 1; i < c5.length; i++) {
+    const h = c5[i].h, l = c5[i].l, ph = c5[i-1].h, pl = c5[i-1].l, pc = c5[i-1].c;
+    trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+    const up = h - ph, dn = pl - l;
+    pdms.push(up > dn && up > 0 ? up : 0);
+    ndms.push(dn > up && dn > 0 ? dn : 0);
+  }
+  let atr = trs.slice(0, period).reduce((a, b) => a + b, 0);
+  let pdm = pdms.slice(0, period).reduce((a, b) => a + b, 0);
+  let ndm = ndms.slice(0, period).reduce((a, b) => a + b, 0);
+  let pdi = 0, ndi = 0;
+  const dxs = [];
+  for (let i = period; i < trs.length; i++) {
+    atr = atr - atr / period + trs[i];
+    pdm = pdm - pdm / period + pdms[i];
+    ndm = ndm - ndm / period + ndms[i];
+    pdi = atr > 0 ? 100 * pdm / atr : 0;
+    ndi = atr > 0 ? 100 * ndm / atr : 0;
+    dxs.push((pdi + ndi) > 0 ? 100 * Math.abs(pdi - ndi) / (pdi + ndi) : 0);
+  }
+  if (dxs.length < period) return null;
+  let adx = dxs.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < dxs.length; i++) adx = (adx * (period - 1) + dxs[i]) / period;
+  return { adx, pdi, ndi };
+}
+
+// RSI(14) de Wilder
+function calcRSI(closes, period) {
+  if (closes.length < period + 1) return null;
+  let g = 0, l = 0;
+  for (let i = 1; i <= period; i++) { const d = closes[i] - closes[i-1]; if (d >= 0) g += d; else l -= d; }
+  let ag = g / period, al = l / period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i-1];
+    ag = (ag * (period - 1) + (d > 0 ? d : 0)) / period;
+    al = (al * (period - 1) + (d < 0 ? -d : 0)) / period;
+  }
+  if (al === 0) return 100;
+  return 100 - 100 / (1 + ag / al);
+}
+
+// Bollinger (20, 2σ)
+function calcBB(closes, period, mult) {
+  if (closes.length < period) return null;
+  const seg = closes.slice(-period);
+  const m = seg.reduce((a, b) => a + b, 0) / period;
+  const sd = Math.sqrt(seg.reduce((a, b) => a + (b - m) * (b - m), 0) / period);
+  return { mid: m, up: m + mult * sd, lo: m - mult * sd, sd };
+}
+
+// Qualite d'un setup mean-reversion (0-99)
+function calcQMR(dir, close, bb, rsi) {
+  const rsiScore = dir === 'LONG'
+    ? Math.min(40, Math.max(0, (32 - rsi) * 2.5))
+    : Math.min(40, Math.max(0, (rsi - 68) * 2.5));
+  const excess = dir === 'LONG' ? (bb.lo - close) : (close - bb.up);
+  const bandScore = bb.sd > 0 ? Math.min(40, Math.max(0, (excess / bb.sd) * 40)) : 0;
+  return Math.min(99, Math.round(20 + rsiScore + bandScore));
+}
+
+function getLev(q)   { return q < 45 ? P.LEV_LOW : q < 70 ? P.LEV_MED : P.LEV_HIGH; }
+function getStake(q) { return q >= 70 ? P.STAKE_MAX : q >= 50 ? P.STAKE_MID : P.STAKE; }
+
+// ═════════════ REGIME (agregation 5m + classification) ═════════════
+function aggregate5m(k) {
+  const b = Math.floor(k.t / 300000);
+  if (S.cur5 && b !== S.cur5.bucket) {
+    S.candles5m.push({ h: S.cur5.h, l: S.cur5.l, c: S.cur5.c });
+    if (S.candles5m.length > 300) S.candles5m.shift();
+    S.cur5 = null;
+    updateRegime();
+  }
+  if (!S.cur5) S.cur5 = { bucket: b, h: k.h, l: k.l, c: k.c };
+  else { S.cur5.h = Math.max(S.cur5.h, k.h); S.cur5.l = Math.min(S.cur5.l, k.l); S.cur5.c = k.c; }
+}
+
+function classifyRegime(r) {
+  if (!r) return 'WARMUP';
+  if (r.adx >= ADX_TREND && r.pdi > r.ndi) return 'UP';
+  if (r.adx >= ADX_TREND && r.ndi > r.pdi) return 'DOWN';
+  return 'RANGE';
+}
+
+function updateRegime() {
+  const r = calcADX(S.candles5m, ADX_PERIOD);
+  if (!r) { S.regime = 'WARMUP'; S.adx = 0; return; }
+  S.adx = r.adx; S.pdi = r.pdi; S.ndi = r.ndi;
+  const prev = S.regime;
+  S.regime = classifyRegime(r);
+  if (prev !== S.regime) {
+    const lbl = { RANGE: '◆ RANGE — mean-reversion 2 sens', UP: '▲ UP — longs seulement', DOWN: '▼ DOWN — shorts seulement' };
+    jlog('sys', `🧭 REGIME ${lbl[S.regime]} | ADX ${r.adx.toFixed(1)} (+DI ${r.pdi.toFixed(1)} / -DI ${r.ndi.toFixed(1)})`);
+  }
+}
+
+// ═════════════ WARM-UP (REST klines mainnet — donnees officielles) ═════════════
+async function fetchKlines(interval, limit) {
+  const r = await fetch(`${KLINE_BASE}/fapi/v1/klines?symbol=${SYMBOL}&interval=${interval}&limit=${limit}`,
+                        { signal: AbortSignal.timeout(8000) });
+  const rows = await r.json();
+  if (!Array.isArray(rows)) throw new Error('klines non-array: ' + JSON.stringify(rows).slice(0, 120));
+  return rows; // [openTime, open, high, low, close, volume, closeTime, ...]
+}
+
+async function seedCandles() {
+  // 1m — moteur EMA / RSI / Bollinger
+  const r1 = await fetchKlines('1m', 121);
+  const done1 = r1.slice(0, -1); // derniere ligne = bougie en cours
+  S.candles1m = done1.map(x => ({ t: x[0], h: parseFloat(x[2]), l: parseFloat(x[3]), c: parseFloat(x[4]) }));
+  S.lastClosed1m = done1.length ? done1[done1.length - 1][0] : 0;
+  S.price = parseFloat(r1[r1.length - 1][4]);
+  jlog('sys', `✅ Warm-up 1m: ${S.candles1m.length} bougies reelles — EMA/RSI/Bollinger prets`);
+  // 5m — ADX pret des la premiere minute
+  const r5 = await fetchKlines('5m', 200);
+  const done5 = r5.slice(0, -1);
+  S.candles5m = done5.map(x => ({ h: parseFloat(x[2]), l: parseFloat(x[3]), c: parseFloat(x[4]) }));
+  const last5 = r5[r5.length - 1];
+  S.cur5 = { bucket: Math.floor(last5[0] / 300000), h: parseFloat(last5[2]), l: parseFloat(last5[3]), c: parseFloat(last5[4]) };
+  updateRegime();
+  jlog('sys', `✅ Warm-up 5m: ${S.candles5m.length} bougies — ADX(14) pret | regime initial: ${S.regime} (ADX ${S.adx.toFixed(1)})`);
+}
+
+// ═════════════ DECISION — uniquement sur cloture 1m (portage exact v5.1) ═════════════
+function onCandleClose(k) {
+  S.candles1m.push(k);
+  if (S.candles1m.length > 240) S.candles1m.shift();
+  aggregate5m(k);
+
+  const closes = S.candles1m.map(x => x.c);
+  const sig = calcSignal(closes);
+  S.sigQ = sig.q; S.sigDir = sig.dir; S.ef = sig.ef || 0; S.es = sig.es || 0;
+
+  if (!S.running || S.killed) return;
+  if (S.trades.length >= P.MAX_OP) return;
+
+  const close = k.c;
+  let wantDir = null, via = '', qEff = 0, mode = 'TREND';
+
+  if (S.regime === 'UP' || S.regime === 'DOWN') {
+    const trendDir = S.regime === 'UP' ? 'LONG' : 'SHORT';
+    const sigDirWant = sig.dir === 'BULL' ? 'LONG' : sig.dir === 'BEAR' ? 'SHORT' : null;
+    if (sigDirWant === trendDir && sig.q >= 50) {
+      wantDir = trendDir; via = S.regime + '-cross'; qEff = sig.q;
+    } else if (sig.ef && sig.es && closes.length >= 3) {
+      const prev = closes[closes.length - 2];
+      if (S.regime === 'UP' && sig.ef >= sig.es) {
+        const pulled  = prev <= sig.es * 1.001;
+        const resumed = close > prev && close > sig.ef * 0.999;
+        if (pulled && resumed && sig.q >= 40) { wantDir = 'LONG'; via = 'UP-cont'; qEff = Math.max(50, sig.q); }
+      } else if (S.regime === 'DOWN' && sig.ef <= sig.es) {
+        const pulled  = prev >= sig.es * 0.999;
+        const resumed = close < prev && close < sig.ef * 1.001;
+        if (pulled && resumed && sig.q >= 40) { wantDir = 'SHORT'; via = 'DOWN-cont'; qEff = Math.max(50, sig.q); }
+      }
+    }
+  } else if (S.regime === 'RANGE') {
+    const bb  = calcBB(closes, 20, 2);
+    const rsi = calcRSI(closes.slice(-60), 14);
+    if (bb && rsi !== null) {
+      if (close <= bb.lo && rsi <= 32)      { wantDir = 'LONG';  via = 'RANGE-MR'; mode = 'RANGE'; qEff = calcQMR('LONG', close, bb, rsi); }
+      else if (close >= bb.up && rsi >= 68) { wantDir = 'SHORT'; via = 'RANGE-MR'; mode = 'RANGE'; qEff = calcQMR('SHORT', close, bb, rsi); }
+    }
+  }
+  if (!wantDir) return;
+
+  // Decret MIN_GAP 1min30
+  const gapLeft = MIN_GAP_MS - (Date.now() - S.lastEntry);
+  if (gapLeft > 0) { jlog('info', `⏳ Signal ${via} ${wantDir} Q:${qEff} ignore — MIN_GAP 1min30 (reste ${Math.ceil(gapLeft/1000)}s)`); return; }
+
+  // Jamais d'ouverture opposee (retournement Q>=75 : coupe les perdants opposes)
+  const hasOpposite = S.trades.some(t => t.dir !== wantDir);
+  if (hasOpposite) {
+    if (qEff >= 75) {
+      for (const t of S.trades.filter(t => t.dir !== wantDir && t.pnl < 0)) closePosition(t, S.price, `🔄 Retournement Q:${qEff}`);
+    }
+    return;
+  }
+
+  // Decret v5.1 — anti-empilement : max 2 meme sens, espacees de 0.3%
+  const sameDir = S.trades.filter(t => t.dir === wantDir);
+  if (sameDir.length >= MAX_SAME_DIR) { jlog('info', `🚧 Signal ${via} ${wantDir} Q:${qEff} ignore — deja ${sameDir.length} position(s) ${wantDir} (plafond ${MAX_SAME_DIR})`); return; }
+  if (sameDir.length > 0) {
+    const nearestPct = Math.min(...sameDir.map(t => Math.abs(close - t.entry) / t.entry));
+    if (nearestPct < ENTRY_SPACING) { jlog('info', `🚧 Signal ${via} ${wantDir} Q:${qEff} ignore — trop proche de l'entree existante (${(nearestPct*100).toFixed(2)}% < 0.3%)`); return; }
+  }
+
+  openPosition(wantDir, close, getLev(qEff), qEff, via, mode);
+}
+
+// ═════════════ EXECUTION ═════════════
+async function ensureLeverage(lev) {
+  if (S.levSet === lev) return;
+  const r = await bnCall(E_BASE, '/fapi/v1/leverage', 'POST', { symbol: SYMBOL, leverage: lev }, E_KEY, E_SECRET);
+  if (r && (r.leverage || r.maxNotionalValue)) { S.levSet = lev; }
+  else jlog('sell', `⚠ Reglage levier ${lev}x refuse: ${JSON.stringify(r).slice(0, 120)}`);
+}
+
+async function openPosition(dir, price, lev, q, via, mode) {
+  const stake = getStake(q);
+  const qty = Math.floor((stake * lev / price) * Math.pow(10, QTY_DEC)) / Math.pow(10, QTY_DEC);
+  if (qty <= 0) { jlog('sell', '⚠ Quantite nulle — entree annulee'); return; }
+  const SL_PCT = P.SL;
+  const TP_PCT = mode === 'RANGE' ? P.TP_RANGE : P.TP;
+  const sl = dir === 'LONG' ? price * (1 - SL_PCT) : price * (1 + SL_PCT);
+  const tp = dir === 'LONG' ? price * (1 + TP_PCT) : price * (1 - TP_PCT);
+
+  const t = {
+    id: Date.now() + Math.random(), dir, entry: price, lev, qty, stake, q, via, mode,
+    sl, tp, slPct: SL_PCT, tpPct: TP_PCT, tpLocked: false, bestPricePct: 0,
+    pnl: 0, openTime: Date.now(), bnIds: null
+  };
+
+  const exitTag = mode === 'RANGE'
+    ? `SL:${sl.toFixed(PX_DEC)} TP FIXE:${tp.toFixed(PX_DEC)} (+${(P.TP_RANGE*100).toFixed(1)}%)`
+    : `SL:${sl.toFixed(PX_DEC)} ARM:${tp.toFixed(PX_DEC)} (trail -${(P.TRAIL*100).toFixed(1)}%)`;
+
+  if (ENGINE_MODE === 'paper') {
+    S.trades.push(t); S.lastEntry = Date.now();
+    jlog('buy', `📝 PAPER ${dir} x${lev} @ ${price.toFixed(PX_DEC)} | $${stake} | via=${via} | ${exitTag}`);
+    sseState(); return;
+  }
+
+  // ── LIVE : MARKET (avec reprise -1007) puis SL + sortie native ──
+  try {
+    await ensureLeverage(lev);
+    const side = dir === 'LONG' ? 'BUY' : 'SELL';
+    const closeSide = dir === 'LONG' ? 'SELL' : 'BUY';
+    const qtyStr = qty.toFixed(QTY_DEC);
+    const cid = 'srv4' + Date.now();
+
+    let order = await bnCall(E_BASE, '/fapi/v1/order', 'POST',
+      { symbol: SYMBOL, side, type: 'MARKET', quantity: qtyStr, reduceOnly: 'false', newClientOrderId: cid }, E_KEY, E_SECRET);
+    if (order && order.code === -1007) {                 // Binance = source de verite avant de re-tenter
+      await sleep(2500);
+      const found = await orderExists(E_BASE, SYMBOL, cid, E_KEY, E_SECRET);
+      if (found) order = { ...found, recovered: true };
+    }
+    if (!order || !order.orderId) { jlog('sell', `⚠ Entree refusee: ${JSON.stringify(order).slice(0, 160)}`); return; }
+
+    t.bnIds = { entry: order.orderId, sl: null, tp: null, slAlgo: false, tpAlgo: false };
+    S.trades.push(t); S.lastEntry = Date.now();
+    jlog('buy', `🔴 LIVE ${dir} x${lev} @ ~${price.toFixed(PX_DEC)} | $${stake} | via=${via} | #${order.orderId}${order.recovered ? ' (recovered)' : ''}`);
+
+    // SL natif — STOP_MARKET par trade
+    const slO = await placeConditional(E_BASE, {
+      symbol: SYMBOL, side: closeSide, type: 'STOP_MARKET',
+      stopPrice: sl.toFixed(PX_DEC), quantity: qtyStr, reduceOnly: 'true'
+    }, E_KEY, E_SECRET);
+    if (slO && slO.orderId) { t.bnIds.sl = slO.orderId; t.bnIds.slAlgo = !!slO.algo; }
+
+    // Sortie native selon le mode
+    const tpO = mode === 'RANGE'
+      ? await placeConditional(E_BASE, { symbol: SYMBOL, side: closeSide, type: 'TAKE_PROFIT_MARKET',
+          stopPrice: tp.toFixed(PX_DEC), quantity: qtyStr, reduceOnly: 'true' }, E_KEY, E_SECRET)
+      : await placeConditional(E_BASE, { symbol: SYMBOL, side: closeSide, type: 'TRAILING_STOP_MARKET',
+          activationPrice: tp.toFixed(PX_DEC), callbackRate: (P.TRAIL * 100).toFixed(1),
+          quantity: qtyStr, reduceOnly: 'true' }, E_KEY, E_SECRET);
+    if (tpO && tpO.orderId) { t.bnIds.tp = tpO.orderId; t.bnIds.tpAlgo = !!tpO.algo; }
+
+    const exitLbl = mode === 'RANGE' ? `TP FIXE ${tp.toFixed(PX_DEC)}` : `TRAILING natif (arm ${tp.toFixed(PX_DEC)}, cb ${(P.TRAIL*100).toFixed(1)}%)`;
+    if (t.bnIds.sl && t.bnIds.tp) jlog('sys', `✅ SL ${sl.toFixed(PX_DEC)} + ${exitLbl} poses cote Binance`);
+    else jlog('sell', `⚠ Protection PARTIELLE — SL:${t.bnIds.sl ? 'OK' : 'ECHEC'} SORTIE:${t.bnIds.tp ? 'OK' : 'ECHEC'}`);
+
+    // REGLE D'OR : jamais de position LIVE sans SL → si le SL a echoue 1 fois, re-tente, sinon FERME
+    if (!t.bnIds.sl) {
+      const retry = await placeConditional(E_BASE, { symbol: SYMBOL, side: closeSide, type: 'STOP_MARKET',
+        stopPrice: sl.toFixed(PX_DEC), quantity: qtyStr, reduceOnly: 'true' }, E_KEY, E_SECRET);
+      if (retry && retry.orderId) { t.bnIds.sl = retry.orderId; t.bnIds.slAlgo = !!retry.algo; jlog('sys', '✅ SL pose au 2e essai'); }
+      else { jlog('sell', '⛔ SL impossible a poser — FERMETURE IMMEDIATE (jamais de position nue)'); await closePosition(t, S.price, '⛔ SL impossible'); }
+    }
+    sseState();
+  } catch (e) { jlog('sell', `⚠ openPosition: ${e.message}`); }
+}
+
+async function cancelTradeStops(t) {
+  if (!t.bnIds) return;
+  for (const c of [{ id: t.bnIds.sl, algo: t.bnIds.slAlgo }, { id: t.bnIds.tp, algo: t.bnIds.tpAlgo }]) {
+    if (!c.id) continue;
+    try {
+      await bnCall(E_BASE, c.algo ? '/fapi/v1/algoOrder' : '/fapi/v1/order', 'DELETE',
+        c.algo ? { algoId: c.id } : { symbol: SYMBOL, orderId: c.id }, E_KEY, E_SECRET);
+    } catch (_) { /* deja execute/annule */ }
+  }
+}
+
+// mirror=true → envoie la fermeture MARKET chez Binance ; false → deja fermee cote exchange
+async function closePosition(t, price, reason, mirror = true) {
+  const raw = t.dir === 'LONG' ? (price - t.entry) / t.entry * t.stake * t.lev
+                               : (t.entry - price) / t.entry * t.stake * t.lev;
+  const fee = t.stake * t.lev * P.FEE_SIDE * 2;
+  t.pnl = raw - fee; t.exit = price; t.reason = reason; t.closeTime = Date.now();
+  S.trades = S.trades.filter(x => x.id !== t.id);
+  S.closed.push(t);
+  if (ENGINE_MODE === 'paper') S.paperCap += t.pnl;
+  jlog(t.pnl >= 0 ? 'buy' : 'sell', `${t.pnl >= 0 ? '✅' : '🔴'} ${t.dir} via=${t.via} | ${reason} | ${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)}`);
+
+  if (ENGINE_MODE === 'live' && mirror && t.bnIds) {
+    await cancelTradeStops(t);
+    const closeSide = t.dir === 'LONG' ? 'SELL' : 'BUY';
+    const r = await bnCall(E_BASE, '/fapi/v1/order', 'POST',
+      { symbol: SYMBOL, side: closeSide, type: 'MARKET', quantity: t.qty.toFixed(QTY_DEC), reduceOnly: 'true' }, E_KEY, E_SECRET);
+    if (r && r.orderId) jlog('sys', `Fermeture Binance #${r.orderId}`);
+    else if (!(r && r.reconciled)) jlog('sell', `⚠ Fermeture: ${JSON.stringify(r).slice(0, 120)}`);
+  }
+  sseState();
+}
+
+// ═════════════ SUIVI PAPER (exits locaux, memes regles que Binance natif) ═════════════
+function paperManage() {
+  if (ENGINE_MODE !== 'paper') return;
+  const price = S.price;
+  if (!price) return;
+  for (const t of [...S.trades]) {
+    const pct = t.dir === 'LONG' ? (price - t.entry) / t.entry : (t.entry - price) / t.entry;
+    if (pct > t.bestPricePct) t.bestPricePct = pct;
+    t.pnl = pct * t.stake * t.lev - t.stake * t.lev * P.FEE_SIDE * 2;
+    if (t.mode === 'RANGE') {
+      if (pct <= -P.SL)       { closePosition(t, price, `🔴 SL -${(P.SL*100).toFixed(1)}%`, false); continue; }
+      if (pct >= P.TP_RANGE)  { closePosition(t, price, `✅ TP fixe +${(P.TP_RANGE*100).toFixed(1)}%`, false); continue; }
+    } else {
+      if (!t.tpLocked && pct >= P.TP) { t.tpLocked = true; jlog('info', `🟢 TRAIL ARME ${t.dir} +${(pct*100).toFixed(2)}%`); }
+      if (!t.tpLocked && pct <= -P.SL) { closePosition(t, price, `🔴 SL -${(P.SL*100).toFixed(1)}%`, false); continue; }
+      if (t.tpLocked && pct <= t.bestPricePct - P.TRAIL) {
+        closePosition(t, price, `✅ Trail +${((t.bestPricePct - P.TRAIL)*100).toFixed(2)}%`, false); continue;
+      }
+    }
+  }
+}
+
+// ═════════════ RECONCILIATION 9s — Binance = SOURCE DE VERITE (live) ═════════════
+async function reconcile() {
+  if (ENGINE_MODE !== 'live' || !S.running) return;
+  try {
+    const pr = await bnCall(E_BASE, '/fapi/v2/positionRisk', 'GET', { symbol: SYMBOL }, E_KEY, E_SECRET);
+    const row = Array.isArray(pr) ? (pr.find(p => p.symbol === SYMBOL) || pr[0]) : null;
+    const netAmt = row ? Math.abs(parseFloat(row.positionAmt || '0')) : 0;
+    S.unreal = row ? (parseFloat(row.unRealizedProfit || '0') || 0) : 0;
+    const localNet = S.trades.reduce((a, t) => a + t.qty, 0);
+
+    // Un stop natif a tire cote Binance → fermer localement (sans miroir) + annuler le stop frere
+    if (localNet - netAmt > 0.0005) {
+      let toClose = localNet - netAmt;
+      for (const t of [...S.trades].sort((a, b) => a.openTime - b.openTime)) {
+        if (toClose <= 0.0005) break;
+        jlog('sys', `⛔ Stop BINANCE declenche — ${t.dir} qty ${t.qty.toFixed(QTY_DEC)}`);
+        await cancelTradeStops(t);
+        await closePosition(t, S.price, '⛔ Stop Binance', false);
+        toClose -= t.qty;
+      }
+    }
+    // Position inconnue (redemarrage serveur) → ADOPTION + pose d'un SL
+    else if (netAmt - localNet > 0.0005 && S.trades.length === 0) {
+      const net = parseFloat(row.positionAmt);
+      const dir = net > 0 ? 'LONG' : 'SHORT';
+      const entry = parseFloat(row.entryPrice || S.price) || S.price;
+      const t = { id: Date.now(), dir, entry, lev: Math.max(1, parseInt(row.leverage || '3')), qty: Math.abs(net),
+                  stake: P.STAKE, q: 50, via: 'ADOPTE', mode: 'TREND', sl: dir === 'LONG' ? entry * (1 - P.SL) : entry * (1 + P.SL),
+                  tp: dir === 'LONG' ? entry * (1 + P.TP) : entry * (1 - P.TP), slPct: P.SL, tpPct: P.TP,
+                  tpLocked: false, bestPricePct: 0, pnl: 0, openTime: Date.now(), bnIds: { entry: 0, sl: null, tp: null } };
+      const closeSide = dir === 'LONG' ? 'SELL' : 'BUY';
+      const slO = await placeConditional(E_BASE, { symbol: SYMBOL, side: closeSide, type: 'STOP_MARKET',
+        stopPrice: t.sl.toFixed(PX_DEC), quantity: t.qty.toFixed(QTY_DEC), reduceOnly: 'true' }, E_KEY, E_SECRET);
+      if (slO && slO.orderId) { t.bnIds.sl = slO.orderId; t.bnIds.slAlgo = !!slO.algo; }
+      S.trades.push(t);
+      jlog('sys', `🤝 Position ADOPTEE (${dir} ${t.qty}) apres redemarrage — SL ${slO && slO.orderId ? 'pose' : 'ECHEC'}`);
+    }
+
+    // KILL SWITCH sur le REEL : (wallet + latent) - depart <= -20% du capital ref
+    const bal = await bnCall(E_BASE, '/fapi/v2/balance', 'GET', {}, E_KEY, E_SECRET);
+    if (Array.isArray(bal)) {
+      const usdt = bal.find(b => b.asset === 'USDT');
+      S.walletNow = usdt ? parseFloat(usdt.balance) : 0;
+      if (S.walletStart > 0 && S.walletNow > 0) {
+        S.sessionPnl = (S.walletNow + S.unreal) - S.walletStart;
+        if (!S.killed && S.sessionPnl <= -(P.CAP * P.KILL)) {
+          S.killed = true;
+          jlog('sell', `⛔ KILL SWITCH REEL — perte session ${S.sessionPnl.toFixed(2)}$ >= ${(P.CAP*P.KILL).toFixed(0)}$ — FERMETURE TOTALE + ARRET`);
+          for (const t of [...S.trades]) await closePosition(t, S.price, '⛔ KILL REEL', true);
+          await bnCall(E_BASE, '/fapi/v1/allOpenOrders', 'DELETE', { symbol: SYMBOL }, E_KEY, E_SECRET); // nettoyage best-effort
+          S.running = false;
+        }
+      }
+    }
+  } catch (e) { jlog('sys', `⚠ Reconciliation: ${e.message}`); }
+  sseState();
+}
+
+// NET REEL comptable (income) toutes les 30s
+async function refreshNetReel() {
+  if (ENGINE_MODE !== 'live' || !S.startedAt) return;
+  try {
+    const rows = await bnCall(E_BASE, '/fapi/v1/income', 'GET', { symbol: SYMBOL, startTime: S.startedAt, limit: 1000 }, E_KEY, E_SECRET);
+    if (!Array.isArray(rows)) return;
+    let pnl = 0, com = 0, fund = 0;
+    for (const r of rows) {
+      const v = parseFloat(r.income || '0'); if (!isFinite(v)) continue;
+      if (r.incomeType === 'REALIZED_PNL') pnl += v;
+      else if (r.incomeType === 'COMMISSION') com += v;
+      else if (r.incomeType === 'FUNDING_FEE') fund += v;
+    }
+    S.netReel = { net: pnl + com + fund, brut: pnl, frais: com, funding: fund };
+  } catch (_) {}
+}
+
+// ═════════════ BOUCLE PRIX — REST klines toutes les 4s (decisions sur clotures 1m) ═════════════
+// Un sondage REST leger (poids 2, ~15 req/min sur endpoint public) suffit : la
+// strategie ne decide QUE sur bougies 1m cloturees. Aucune dependance WebSocket,
+// aucun throttling navigateur, survit nativement aux micro-coupures.
+let pollBusy = false;
+async function pollLoop() {
+  if (pollBusy || !S.running) return;
+  pollBusy = true;
+  try {
+    const rows = await fetchKlines('1m', 3);
+    S.price = parseFloat(rows[rows.length - 1][4]);         // prix live = close de la bougie en cours
+    for (let i = 0; i < rows.length - 1; i++) {             // toutes sauf la derniere = CLOTUREES
+      const x = rows[i];
+      if (x[0] > S.lastClosed1m) {
+        S.lastClosed1m = x[0];
+        onCandleClose({ t: x[0], h: parseFloat(x[2]), l: parseFloat(x[3]), c: parseFloat(x[4]) });
+      }
+    }
+    paperManage();
+    // Suivi PnL live affichage (les sorties LIVE sont executees par Binance)
+    if (ENGINE_MODE === 'live') {
+      for (const t of S.trades) {
+        const pct = t.dir === 'LONG' ? (S.price - t.entry) / t.entry : (t.entry - S.price) / t.entry;
+        if (pct > t.bestPricePct) t.bestPricePct = pct;
+        if (t.mode !== 'RANGE' && !t.tpLocked && pct >= P.TP) { t.tpLocked = true; jlog('info', `🟢 TRAIL ARME ${t.dir} (suivi par BINANCE natif)`); }
+        t.pnl = pct * t.stake * t.lev - t.stake * t.lev * P.FEE_SIDE * 2;
+      }
+    }
+    S.ticks++;
+    const now = Date.now();
+    if (now - S.lastHb >= 60000) {
+      S.lastHb = now;
+      jlog('sys', `💓 ${S.ticks} polls/min · ${SYMBOL} ${S.price.toFixed(PX_DEC)} · regime ${S.regime}${S.adx ? ' ADX ' + S.adx.toFixed(0) : ''} · ${S.trades.length} pos · ${ENGINE_MODE.toUpperCase()}`);
+      S.ticks = 0;
+    }
+    sseState();
+  } catch (e) { jlog('sys', `⚠ poll: ${e.message}`); }
+  pollBusy = false;
+}
+
+// ═════════════ SSE — le dashboard est un SPECTATEUR pur ═════════════
+const sseClients = new Set();
+function sseBroadcast(obj) {
+  const line = `data: ${JSON.stringify(obj)}\n\n`;
+  for (const res of sseClients) { try { res.write(line); } catch (_) {} }
+}
+let lastStatePush = 0;
+function sseState(force) {
+  const now = Date.now();
+  if (!force && now - lastStatePush < 1500) return;   // 1 push max / 1.5s
+  lastStatePush = now;
+  const wins = S.closed.filter(t => t.pnl > 0).length;
+  const viaStats = {};
+  for (const t of S.closed) {
+    if (!viaStats[t.via]) viaStats[t.via] = { n: 0, w: 0, pnl: 0 };
+    viaStats[t.via].n++; if (t.pnl > 0) viaStats[t.via].w++; viaStats[t.via].pnl += t.pnl;
+  }
+  sseBroadcast({ kind: 'state', s: {
+    mode: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, killed: S.killed,
+    price: S.price, regime: S.regime, adx: S.adx, pdi: S.pdi, ndi: S.ndi,
+    sigQ: S.sigQ, sigDir: S.sigDir,
+    cap: P.CAP, paperCap: S.paperCap, wallet: S.walletNow, sessionPnl: S.sessionPnl, unreal: S.unreal,
+    netReel: S.netReel,
+    open: S.trades.map(t => ({ dir: t.dir, via: t.via, mode: t.mode, lev: t.lev, entry: t.entry, qty: t.qty, stake: t.stake, pnl: t.pnl, tpLocked: t.tpLocked, sl: t.sl, tp: t.tp })),
+    closedN: S.closed.length, wins, wr: S.closed.length ? Math.round(100 * wins / S.closed.length) : null,
+    viaStats,
+    lastClosed: S.closed.slice(-8).reverse().map(t => ({ dir: t.dir, via: t.via, pnl: t.pnl, reason: t.reason }))
+  }});
+}
+
+app.get('/api/stream', (req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'Access-Control-Allow-Origin': '*' });
+  res.write(`data: ${JSON.stringify({ kind: 'hello', journal: S.journal.slice(-60) })}\n\n`);
+  sseClients.add(res);
+  sseState(true);
+  req.on('close', () => sseClients.delete(res));
+});
+
+app.get('/api/state', (req, res) => { sseState(true); res.status(200).json({ ok: true, mode: ENGINE_MODE, running: S.running, regime: S.regime, adx: S.adx, price: S.price, open: S.trades.length, closed: S.closed.length }); });
+
+// ═════════════ DASHBOARD INTEGRE (spectateur pur — AUCUNE cle, AUCUNE logique) ═════════════
+const DASH_HTML = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Itachi v6 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
+<style>
+:root{--bg:#0a0e14;--surface:#111722;--border:#1d2635;--text:#e6edf3;--muted:#7d8ba1;--teal:#00f5c8;--red:#ff3056;--yellow:#ffc94d}
+*{box-sizing:border-box;margin:0;padding:0}body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',ui-monospace,monospace;font-size:13px;padding:14px}
+.top{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+.logo{font-weight:700;font-size:16px}.logo b{color:var(--teal)}
+.badge{padding:3px 10px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:1px;border:1px solid var(--border)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:12px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px}
+.lbl{font-size:9px;color:var(--muted);letter-spacing:1.5px;margin-bottom:4px}.val{font-size:16px;font-weight:700}
+.teal{color:var(--teal)}.red{color:var(--red)}.yel{color:var(--yellow)}.mut{color:var(--muted)}
+table{width:100%;border-collapse:collapse;font-size:11px}th{color:var(--muted);font-size:9px;letter-spacing:1px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border)}
+td{padding:6px 8px;border-bottom:1px solid var(--border)}
+#journal{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px;height:260px;overflow-y:auto;font-size:11px;line-height:1.8}
+h3{font-size:10px;color:var(--muted);letter-spacing:2px;margin:14px 0 6px}
+.jl-sys{color:var(--muted)}.jl-buy{color:var(--teal)}.jl-sell{color:var(--red)}.jl-info{color:var(--yellow)}
+</style></head><body>
+<div class="top">
+  <span class="logo">CryptoSignal<b>AI</b> <span class="mut" style="font-weight:400;font-size:11px">/ Itachi v6 SERVER · Srv 4.0 · WR: à mesurer</span></span>
+  <span class="badge" id="bMode">—</span><span class="badge" id="bRegime">—</span><span class="badge" id="bRun">—</span>
+</div>
+<div class="grid">
+  <div class="card"><div class="lbl">PRIX</div><div class="val teal" id="vPrice">—</div></div>
+  <div class="card"><div class="lbl">SIGNAL Q</div><div class="val" id="vQ">—</div></div>
+  <div class="card"><div class="lbl">P&L SESSION (RÉEL)</div><div class="val" id="vPnl">—</div></div>
+  <div class="card"><div class="lbl">NET RÉEL BINANCE</div><div class="val" id="vNet">—</div></div>
+  <div class="card"><div class="lbl">OUVERTES</div><div class="val yel" id="vOpen">0</div></div>
+  <div class="card"><div class="lbl">FERMÉES</div><div class="val" id="vClosed">0</div></div>
+  <div class="card"><div class="lbl">WIN RATE</div><div class="val teal" id="vWR">—</div></div>
+</div>
+<h3>POSITIONS OUVERTES</h3>
+<div class="card"><table><thead><tr><th>SENS</th><th>VIA</th><th>MODE</th><th>LEV</th><th>ENTRÉE</th><th>QTY</th><th>SL</th><th>SORTIE</th><th>P&L</th></tr></thead><tbody id="tOpen"><tr><td colspan="9" class="mut">Aucune position</td></tr></tbody></table></div>
+<h3>WIN RATE PAR VOIE (via=)</h3>
+<div class="card"><table><thead><tr><th>VOIE</th><th>TRADES</th><th>WR</th><th>P&L NET</th></tr></thead><tbody id="tVia"><tr><td colspan="4" class="mut">En attente des premiers trades</td></tr></tbody></table></div>
+<h3>JOURNAL BOT</h3>
+<div id="journal"></div>
+<script>
+const $=id=>document.getElementById(id);
+function fp(x,d){return x==null?'—':Number(x).toLocaleString('fr-FR',{minimumFractionDigits:d,maximumFractionDigits:d})}
+function money(x){if(x==null)return '—';const s=x>=0?'+$':'-$';return s+Math.abs(x).toFixed(2)}
+function addLog(e){const d=new Date(e.ts).toLocaleTimeString('fr-FR');const div=document.createElement('div');div.className='jl-'+e.type;div.textContent=d+'  '+e.msg;const j=$('journal');j.prepend(div);while(j.children.length>200)j.lastChild.remove()}
+function render(s){
+  $('bMode').textContent=s.mode.toUpperCase()+' · '+s.net.toUpperCase();
+  $('bMode').style.color=s.mode==='live'?'var(--red)':s.mode==='paper'?'var(--yellow)':'var(--muted)';
+  const rl={RANGE:'◆ RANGE · MR 2 sens',UP:'▲ UP · longs',DOWN:'▼ DOWN · shorts',WARMUP:'⏳ WARM-UP'};
+  const rc={RANGE:'var(--yellow)',UP:'var(--teal)',DOWN:'var(--red)',WARMUP:'var(--muted)'};
+  $('bRegime').textContent=(rl[s.regime]||s.regime)+(s.adx?' · ADX '+s.adx.toFixed(0):'');
+  $('bRegime').style.color=rc[s.regime]||'var(--muted)';
+  $('bRun').textContent=s.killed?'⛔ KILL':s.running?'● EN MARCHE':'⏸ ARRÊTÉ';
+  $('bRun').style.color=s.killed?'var(--red)':s.running?'var(--teal)':'var(--muted)';
+  $('vPrice').textContent='$'+fp(s.price,1);
+  $('vQ').textContent=s.sigQ+' '+(s.sigDir==='BULL'?'▲':s.sigDir==='BEAR'?'▼':'—');
+  const pnl=s.mode==='paper'?(s.paperCap-s.cap):s.sessionPnl;
+  $('vPnl').textContent=money(pnl);$('vPnl').className='val '+(pnl>=0?'teal':'red');
+  $('vNet').textContent=s.netReel?money(s.netReel.net):'—';
+  if(s.netReel)$('vNet').className='val '+(s.netReel.net>=0?'teal':'red');
+  $('vOpen').textContent=s.open.length;$('vClosed').textContent=s.closedN;
+  $('vWR').textContent=s.wr==null?'—':s.wr+'%';
+  $('tOpen').innerHTML=s.open.length?s.open.map(t=>'<tr><td class="'+(t.dir==='LONG'?'teal':'red')+'">'+t.dir+'</td><td>'+t.via+'</td><td>'+(t.mode==='RANGE'?'◆ MR':t.tpLocked?'🟢 TRAIL':'⏳')+'</td><td>x'+t.lev+'</td><td>'+fp(t.entry,1)+'</td><td>'+t.qty+'</td><td>'+fp(t.sl,1)+'</td><td>'+fp(t.tp,1)+'</td><td class="'+(t.pnl>=0?'teal':'red')+'">'+money(t.pnl)+'</td></tr>').join(''):'<tr><td colspan="9" class="mut">Aucune position</td></tr>';
+  const vs=Object.entries(s.viaStats||{});
+  $('tVia').innerHTML=vs.length?vs.map(([v,x])=>'<tr><td>'+v+'</td><td>'+x.n+'</td><td>'+Math.round(100*x.w/x.n)+'%</td><td class="'+(x.pnl>=0?'teal':'red')+'">'+money(x.pnl)+'</td></tr>').join(''):'<tr><td colspan="4" class="mut">En attente des premiers trades</td></tr>';
+}
+const es=new EventSource('/api/stream');
+es.onmessage=ev=>{const d=JSON.parse(ev.data);
+  if(d.kind==='hello'&&d.journal)d.journal.slice().reverse().forEach(addLog);
+  else if(d.kind==='log')addLog(d.e);
+  else if(d.kind==='state')render(d.s);};
+</script></body></html>`;
+
+app.get('/', (req, res) => {
+  res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(DASH_HTML);
+});
+app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v6.0-server-engine', engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream'] }));
+
+// ═════════════ DEMARRAGE MOTEUR ═════════════
+async function startEngine() {
+  if (ENGINE_MODE === 'off') { console.log('[BOT] ENGINE_MODE=off — serveur en mode PROXY PUR (comportement v3.5). Regler ENGINE_MODE=paper|live + cles pour activer.'); return; }
+  if (ENGINE_MODE === 'live' && (!E_KEY || !E_SECRET)) { console.log('[BOT] ⛔ ENGINE_MODE=live mais BINANCE_API_KEY/SECRET absentes — moteur NON demarre.'); return; }
+  try {
+    jlog('sys', `🚀 Itachi v6 SERVER · Srv 4.0 · WR: a mesurer — ${ENGINE_MODE.toUpperCase()} ${ENGINE_NET.toUpperCase()} ${SYMBOL} — MULTI-REGIME ADX(14) 5m · SL -0.8% · TREND: trail natif +1.6%/-0.5% · RANGE: TP fixe +0.7% · MIN_GAP 1min30 · MAX 2 meme sens (0.3%) · KILL -${(P.CAP*P.KILL).toFixed(0)}$ reel`);
+    await seedCandles();
+    if (ENGINE_MODE === 'live') {
+      const bal = await bnCall(E_BASE, '/fapi/v2/balance', 'GET', {}, E_KEY, E_SECRET);
+      const usdt = Array.isArray(bal) ? bal.find(b => b.asset === 'USDT') : null;
+      if (!usdt) { jlog('sell', `⛔ Lecture solde impossible (${JSON.stringify(bal).slice(0, 120)}) — moteur NON demarre.`); return; }
+      S.walletStart = parseFloat(usdt.balance); S.walletNow = S.walletStart;
+      jlog('sys', `✅ 🔴 LIVE ${ENGINE_NET} — wallet depart: $${S.walletStart.toFixed(2)} | KILL a ${(-(P.CAP*P.KILL)).toFixed(0)}$ de perte session`);
+    } else {
+      jlog('sys', `📝 PAPER — capital simule $${S.paperCap.toFixed(2)}, prix reels, AUCUN ordre envoye`);
+    }
+    S.running = true; S.startedAt = Date.now(); S.lastHb = Date.now();
+    setInterval(pollLoop, 4000);
+    if (ENGINE_MODE === 'live') { setInterval(reconcile, 9000); setInterval(refreshNetReel, 30000); refreshNetReel(); }
+    jlog('sys', '🔁 Boucle prix 4s active — decisions sur clotures 1m officielles | Binance = source de verite (9s)');
+  } catch (e) {
+    jlog('sell', `⛔ Demarrage moteur echoue: ${e.message} — nouvel essai dans 30s`);
+    setTimeout(startEngine, 30000);
+  }
+}
+
+// ═════════════ SELFTEST (node server.js --selftest : AUCUN reseau, AUCUN port) ═════════════
+if (process.argv.includes('--selftest')) {
+  (function selftest() {
+    let ok = true;
+    const assert = (cond, name) => { console.log((cond ? '✅' : '❌') + ' ' + name); if (!cond) ok = false; };
+    // EMA : serie constante → EMA = constante
+    assert(Math.abs(calcEMA(Array(50).fill(100), 21) - 100) < 1e-9, 'EMA constante = 100');
+    // RSI : hausse pure → 100 ; baisse pure → ~0
+    const up = Array.from({ length: 40 }, (_, i) => 100 + i);
+    const dn = Array.from({ length: 40 }, (_, i) => 100 - i);
+    assert(calcRSI(up, 14) === 100, 'RSI hausse pure = 100');
+    assert(calcRSI(dn, 14) < 1, 'RSI baisse pure < 1');
+    // Bollinger : serie constante → sd=0, bandes = mid
+    const bb0 = calcBB(Array(30).fill(50), 20, 2);
+    assert(bb0.sd === 0 && bb0.up === 50 && bb0.lo === 50, 'BB constante : bandes = mid');
+    // ADX : tendance haussiere monotone → +DI > -DI et ADX eleve ; bruit plat → ADX faible
+    const trendUp = Array.from({ length: 80 }, (_, i) => ({ h: 100 + i + 0.5, l: 100 + i - 0.5, c: 100 + i }));
+    const rUp = calcADX(trendUp, 14);
+    assert(rUp && rUp.pdi > rUp.ndi && rUp.adx > 60, `ADX tendance up : +DI>${rUp ? rUp.ndi.toFixed(1) : '?'} -DI, ADX=${rUp ? rUp.adx.toFixed(1) : '?'} > 60`);
+    const flat = Array.from({ length: 80 }, (_, i) => ({ h: 100 + (i % 2 ? 0.4 : 0.5), l: 100 - (i % 2 ? 0.5 : 0.4), c: 100 + (i % 2 ? -0.1 : 0.1) }));
+    const rFlat = calcADX(flat, 14);
+    assert(rFlat && rFlat.adx < ADX_TREND, `ADX marche plat = ${rFlat ? rFlat.adx.toFixed(1) : '?'} < ${ADX_TREND} → RANGE`);
+    assert(classifyRegime(rUp) === 'UP' && classifyRegime(rFlat) === 'RANGE', 'classifyRegime : UP / RANGE corrects');
+    const trendDn = Array.from({ length: 80 }, (_, i) => ({ h: 200 - i + 0.5, l: 200 - i - 0.5, c: 200 - i }));
+    assert(classifyRegime(calcADX(trendDn, 14)) === 'DOWN', 'classifyRegime : DOWN correct');
+    // QMR : plus l extreme est marque, plus Q monte
+    const bbT = { mid: 100, up: 102, lo: 98, sd: 1 };
+    const qFaible = calcQMR('LONG', 98.0, bbT, 32);   // limite pile
+    const qFort   = calcQMR('LONG', 97.0, bbT, 15);   // RSI 15 + 1σ sous la bande
+    assert(qFaible === 20 && qFort > 80, `QMR gradue : limite=${qFaible}, extreme=${qFort}`);
+    // Grille decrets
+    assert(getLev(40) === 3 && getLev(60) === 7 && getLev(85) === 12, 'Leviers 3/7/12 par Q');
+    assert(getStake(40) === 50 && getStake(60) === 67.5 && getStake(85) === 87.5, 'Mises 50/67.5/87.5 par Q');
+    console.log(ok ? '\n════ SELFTEST COMPLET : TOUT PASSE ════' : '\n════ SELFTEST : ECHECS DETECTES ════');
+    process.exit(ok ? 0 : 1);
+  })();
+} else {
+  startEngine();
+}
+
+// ══ ECOUTE (apres definition de TOUTES les routes) ══
+if (!process.argv.includes('--selftest')) {
+  app.listen(PORT, () => console.log(`Itachi BOT-BTC v6.0 (Srv 4.0 — proxy + moteur ${ENGINE_MODE.toUpperCase()}) en ecoute sur le port ${PORT}`));
+}
+
