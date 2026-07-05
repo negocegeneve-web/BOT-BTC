@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-//  server.js — Proxy Binance Futures (Railway) — v3.3 "Champion"
+//  server.js — Proxy Binance Futures (Railway) — v3.5 "Champion"
 //  Transport transplanté du serveur 3.13-Champion (qui trade avec
 //  succès sur le même demo-fapi, depuis le même Railway EU West) :
 //   1. KEEP-WARM 3s  : le pool undici ferme les connexions après ~4s
@@ -144,11 +144,17 @@ async function placeConditional(base, params, apiKey, apiSecret) {
     algoType: 'CONDITIONAL',                                   // obligatoire (doc)
     symbol: params.symbol,
     side: params.side,
-    type: params.type,                                        // ← v3.4 'type' (correctif -1102) : STOP_MARKET | TAKE_PROFIT_MARKET
-    triggerPrice: params.stopPrice,
+    type: params.type,                                        // STOP_MARKET | TAKE_PROFIT_MARKET | TRAILING_STOP_MARKET
     workingType: params.workingType || 'MARK_PRICE',
-    timeInForce: params.timeInForce || 'GTC',                 // ← v3.4 GTC (valeur valide doc)
   };
+  if (params.type === 'TRAILING_STOP_MARKET') {
+    // v3.5 — trailing NATIF Binance : suivi du pic cote exchange, gain non plafonne.
+    if (params.callbackRate    != null) algoParams.callbackRate    = params.callbackRate;    // en % (0.1 a 10)
+    if (params.activationPrice != null) algoParams.activationPrice = params.activationPrice; // niveau d'armement (= ancien TP)
+  } else {
+    algoParams.triggerPrice = params.stopPrice;
+    algoParams.timeInForce  = params.timeInForce || 'GTC';    // GTC (valeur valide doc)
+  }
   // Stops PAR TRADE : si une quantité est fournie, le stop ne ferme que SA part
   if (params.quantity != null && params.quantity !== '') {
     algoParams.quantity   = params.quantity;
@@ -167,8 +173,8 @@ async function placeConditional(base, params, apiKey, apiSecret) {
 }
 
 // ── Health ──
-app.get('/', (req, res) => res.status(200).json({ ok: true, service: 'Itachi Proxy Binance', version: 'v3.4-type-fix-pnlreel', clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel'] }));
-app.get('/api/binance', (req, res) => res.status(200).json({ ok: true, msg: 'Proxy Railway vivant (v3.4 : stops corriges type + reconciliation fermeture + PnL reel/frais + keep-warm + horloge)', clockOffsetMs: Math.round(TIME_OFFSET), modes: Object.keys(BN_BASES) }));
+app.get('/', (req, res) => res.status(200).json({ ok: true, service: 'Itachi Proxy Binance', version: 'v3.5-trailing-natif', clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel'] }));
+app.get('/api/binance', (req, res) => res.status(200).json({ ok: true, msg: 'Proxy Railway vivant (v3.5 : trailing natif + stops type + reconciliation fermeture + PnL reel + keep-warm)', clockOffsetMs: Math.round(TIME_OFFSET), modes: Object.keys(BN_BASES) }));
 
 // ══ POINT 2 — P&L NET RÉEL + FRAIS depuis Binance (source de vérité comptable) ══
 // La PWA interroge cet endpoint (POST, clés dans headers comme /api/binance)
@@ -226,7 +232,7 @@ app.post('/api/pnl-reel', async (req, res) => {
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v3.4-type-fix-pnlreel', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v3.5-trailing-natif', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -282,7 +288,7 @@ app.post('/api/binance', async (req, res) => {
     const params = { ...(body.params || {}) };
 
     const isOrder = method === 'POST' && path.includes('/order');
-    const isConditional = isOrder && (params.type === 'STOP_MARKET' || params.type === 'TAKE_PROFIT_MARKET');
+    const isConditional = isOrder && (params.type === 'STOP_MARKET' || params.type === 'TAKE_PROFIT_MARKET' || params.type === 'TRAILING_STOP_MARKET');
 
     let data;
 
@@ -359,4 +365,4 @@ app.post('/api/binance', async (req, res) => {
 syncTimeAndWarm();
 setInterval(syncTimeAndWarm, 3000);
 
-app.listen(PORT, () => console.log(`Proxy Binance v3.4 (type-fix + PnL reel) en ecoute sur le port ${PORT}`));
+app.listen(PORT, () => console.log(`Proxy Binance v3.5 (trailing natif) en ecoute sur le port ${PORT}`));
