@@ -232,7 +232,7 @@ app.post('/api/pnl-reel', async (req, res) => {
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v6.0-server-engine', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v6.2-calme-q35', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -410,6 +410,9 @@ const MIN_GAP_MS    = 90 * 1000;   // decret v5.1 : 1min30 entre deux entrees
 const MAX_SAME_DIR  = 2;           // decret v5.1 : max 2 positions meme sens
 const ENTRY_SPACING = 0.003;       // decret v5.1 : espacement >= 0.3% entre entrees meme sens
 const ADX_PERIOD = 14, ADX_TREND = 20;
+// ── DECRET 05/07 « marche calme, Q35 ok » ──
+const RSI_LO = 38, RSI_HI = 62;    // bornes RSI assouplies en RANGE (etaient 32/68)
+const QMR_MIN = 35;                // plancher de qualite mean-reversion decrete
 const QTY_DEC = SYMBOL === 'BTCUSDT' ? 3 : 0;      // precision quantite
 const PX_DEC  = SYMBOL === 'BTCUSDT' ? 1 : 2;      // precision prix
 
@@ -429,7 +432,9 @@ const S = {
   paperCap: parseFloat(process.env.CAPITAL || '500'),
   startedAt: 0, ticks: 0, lastHb: 0,
   levSet: 0,                   // dernier levier pousse a Binance (cache)
-  journal: []                  // { ts, type, msg } (max 400)
+  journal: [],                 // { ts, type, msg } (max 400)
+  diag: [],                    // TELEMETRIE : 1 snapshot par cloture 1m (max 240)
+  funnel: {}                   // compteurs de verdicts depuis le demarrage
 };
 
 function jlog(type, msg) {
@@ -526,8 +531,8 @@ function calcBB(closes, period, mult) {
 // Qualite d'un setup mean-reversion (0-99)
 function calcQMR(dir, close, bb, rsi) {
   const rsiScore = dir === 'LONG'
-    ? Math.min(40, Math.max(0, (32 - rsi) * 2.5))
-    : Math.min(40, Math.max(0, (rsi - 68) * 2.5));
+    ? Math.min(40, Math.max(0, (RSI_LO - rsi) * 2.5))
+    : Math.min(40, Math.max(0, (rsi - RSI_HI) * 2.5));
   const excess = dir === 'LONG' ? (bb.lo - close) : (close - bb.up);
   const bandScore = bb.sd > 0 ? Math.min(40, Math.max(0, (excess / bb.sd) * 40)) : 0;
   return Math.min(99, Math.round(20 + rsiScore + bandScore));
@@ -596,6 +601,20 @@ async function seedCandles() {
 }
 
 // ═════════════ DECISION — uniquement sur cloture 1m (portage exact v5.1) ═════════════
+// TELEMETRIE : verdict de CHAQUE cloture 1m (l'entonnoir de decision)
+function recordDiag(k, sig, extra, verdict) {
+  S.funnel[verdict] = (S.funnel[verdict] || 0) + 1;
+  S.diag.push({ t: k.t, c: k.c, regime: S.regime, adx: +S.adx.toFixed(1),
+                q: sig.q, dir: sig.dir, ...extra, verdict });
+  if (S.diag.length > 240) S.diag.shift();
+  if (!recordDiag._n) recordDiag._n = 0;
+  if (++recordDiag._n % 15 === 0) {
+    const top = Object.entries(S.funnel).sort((a, b) => b[1] - a[1]).slice(0, 4)
+      .map(([v, n]) => `${v}:${n}`).join(' · ');
+    jlog('info', `🔬 ENTONNOIR (${recordDiag._n} clotures) — ${top}`);
+  }
+}
+
 function onCandleClose(k) {
   S.candles1m.push(k);
   if (S.candles1m.length > 240) S.candles1m.shift();
@@ -605,13 +624,20 @@ function onCandleClose(k) {
   const sig = calcSignal(closes);
   S.sigQ = sig.q; S.sigDir = sig.dir; S.ef = sig.ef || 0; S.es = sig.es || 0;
 
-  if (!S.running || S.killed) return;
-  if (S.trades.length >= P.MAX_OP) return;
+  const bb  = calcBB(closes, 20, 2);
+  const rsi = calcRSI(closes.slice(-60), 14);
+  const dx = { rsi: rsi == null ? null : +rsi.toFixed(1),
+               bbLo: bb ? +((k.c - bb.lo) / bb.lo * 100).toFixed(3) : null,
+               bbUp: bb ? +((k.c - bb.up) / bb.up * 100).toFixed(3) : null };
+
+  if (!S.running || S.killed)        return recordDiag(k, sig, dx, S.killed ? 'KILL' : 'ARRETE');
+  if (S.trades.length >= P.MAX_OP)   return recordDiag(k, sig, dx, 'MAX_POSITIONS');
 
   const close = k.c;
-  let wantDir = null, via = '', qEff = 0, mode = 'TREND';
+  let wantDir = null, via = '', qEff = 0, mode = 'TREND', blocked = null;
 
-  if (S.regime === 'UP' || S.regime === 'DOWN') {
+  if (S.regime === 'WARMUP') blocked = 'ADX_WARMUP';
+  else if (S.regime === 'UP' || S.regime === 'DOWN') {
     const trendDir = S.regime === 'UP' ? 'LONG' : 'SHORT';
     const sigDirWant = sig.dir === 'BULL' ? 'LONG' : sig.dir === 'BEAR' ? 'SHORT' : null;
     if (sigDirWant === trendDir && sig.q >= 50) {
@@ -622,25 +648,38 @@ function onCandleClose(k) {
         const pulled  = prev <= sig.es * 1.001;
         const resumed = close > prev && close > sig.ef * 0.999;
         if (pulled && resumed && sig.q >= 40) { wantDir = 'LONG'; via = 'UP-cont'; qEff = Math.max(50, sig.q); }
+        else blocked = !pulled ? 'TREND_SANS_PULLBACK' : !resumed ? 'TREND_SANS_REPRISE' : 'TREND_Q<40';
       } else if (S.regime === 'DOWN' && sig.ef <= sig.es) {
         const pulled  = prev >= sig.es * 0.999;
         const resumed = close < prev && close < sig.ef * 1.001;
         if (pulled && resumed && sig.q >= 40) { wantDir = 'SHORT'; via = 'DOWN-cont'; qEff = Math.max(50, sig.q); }
-      }
-    }
+        else blocked = !pulled ? 'TREND_SANS_PULLBACK' : !resumed ? 'TREND_SANS_REPRISE' : 'TREND_Q<40';
+      } else blocked = 'TREND_EMA_CONTRE_REGIME';
+      if (!wantDir && !blocked)
+        blocked = sigDirWant === null ? 'TREND_DIR_NEUTRE' : sigDirWant !== trendDir ? 'TREND_DIR_OPPOSEE' : 'TREND_Q<50';
+    } else blocked = sigDirWant === null ? 'TREND_DIR_NEUTRE' : sigDirWant !== trendDir ? 'TREND_DIR_OPPOSEE' : 'TREND_Q<50';
   } else if (S.regime === 'RANGE') {
-    const bb  = calcBB(closes, 20, 2);
-    const rsi = calcRSI(closes.slice(-60), 14);
     if (bb && rsi !== null) {
-      if (close <= bb.lo && rsi <= 32)      { wantDir = 'LONG';  via = 'RANGE-MR'; mode = 'RANGE'; qEff = calcQMR('LONG', close, bb, rsi); }
-      else if (close >= bb.up && rsi >= 68) { wantDir = 'SHORT'; via = 'RANGE-MR'; mode = 'RANGE'; qEff = calcQMR('SHORT', close, bb, rsi); }
-    }
+      // Decret « Q35 » : bornes RSI assouplies, le PLANCHER QMR>=35 devient le juge
+      if (close <= bb.lo && rsi <= RSI_LO) {
+        const qmr = calcQMR('LONG', close, bb, rsi);
+        if (qmr >= QMR_MIN) { wantDir = 'LONG'; via = 'RANGE-MR'; mode = 'RANGE'; qEff = qmr; }
+        else blocked = 'RANGE_QMR<' + QMR_MIN + '_(' + qmr + ')';
+      } else if (close >= bb.up && rsi >= RSI_HI) {
+        const qmr = calcQMR('SHORT', close, bb, rsi);
+        if (qmr >= QMR_MIN) { wantDir = 'SHORT'; via = 'RANGE-MR'; mode = 'RANGE'; qEff = qmr; }
+        else blocked = 'RANGE_QMR<' + QMR_MIN + '_(' + qmr + ')';
+      }
+      else if (close <= bb.lo || close >= bb.up) blocked = 'RANGE_BANDE_OK_RSI_TIEDE';
+      else if (rsi <= RSI_LO || rsi >= RSI_HI)   blocked = 'RANGE_RSI_OK_DANS_BANDES';
+      else                                       blocked = 'RANGE_CALME';
+    } else blocked = 'RANGE_INDIC_PAS_PRETS';
   }
-  if (!wantDir) return;
+  if (!wantDir) return recordDiag(k, sig, dx, blocked || 'AUCUN_SETUP');
 
   // Decret MIN_GAP 1min30
   const gapLeft = MIN_GAP_MS - (Date.now() - S.lastEntry);
-  if (gapLeft > 0) { jlog('info', `⏳ Signal ${via} ${wantDir} Q:${qEff} ignore — MIN_GAP 1min30 (reste ${Math.ceil(gapLeft/1000)}s)`); return; }
+  if (gapLeft > 0) { jlog('info', `⏳ Signal ${via} ${wantDir} Q:${qEff} ignore — MIN_GAP 1min30 (reste ${Math.ceil(gapLeft/1000)}s)`); return recordDiag(k, sig, dx, 'MIN_GAP'); }
 
   // Jamais d'ouverture opposee (retournement Q>=75 : coupe les perdants opposes)
   const hasOpposite = S.trades.some(t => t.dir !== wantDir);
@@ -648,17 +687,18 @@ function onCandleClose(k) {
     if (qEff >= 75) {
       for (const t of S.trades.filter(t => t.dir !== wantDir && t.pnl < 0)) closePosition(t, S.price, `🔄 Retournement Q:${qEff}`);
     }
-    return;
+    return recordDiag(k, sig, dx, 'POSITION_OPPOSEE');
   }
 
   // Decret v5.1 — anti-empilement : max 2 meme sens, espacees de 0.3%
   const sameDir = S.trades.filter(t => t.dir === wantDir);
-  if (sameDir.length >= MAX_SAME_DIR) { jlog('info', `🚧 Signal ${via} ${wantDir} Q:${qEff} ignore — deja ${sameDir.length} position(s) ${wantDir} (plafond ${MAX_SAME_DIR})`); return; }
+  if (sameDir.length >= MAX_SAME_DIR) { jlog('info', `🚧 Signal ${via} ${wantDir} Q:${qEff} ignore — deja ${sameDir.length} position(s) ${wantDir} (plafond ${MAX_SAME_DIR})`); return recordDiag(k, sig, dx, 'PLAFOND_2'); }
   if (sameDir.length > 0) {
     const nearestPct = Math.min(...sameDir.map(t => Math.abs(close - t.entry) / t.entry));
-    if (nearestPct < ENTRY_SPACING) { jlog('info', `🚧 Signal ${via} ${wantDir} Q:${qEff} ignore — trop proche de l'entree existante (${(nearestPct*100).toFixed(2)}% < 0.3%)`); return; }
+    if (nearestPct < ENTRY_SPACING) { jlog('info', `🚧 Signal ${via} ${wantDir} Q:${qEff} ignore — trop proche de l'entree existante (${(nearestPct*100).toFixed(2)}% < 0.3%)`); return recordDiag(k, sig, dx, 'ESPACEMENT'); }
   }
 
+  recordDiag(k, sig, dx, 'ENTREE_' + via);
   openPosition(wantDir, close, getLev(qEff), qEff, via, mode);
 }
 
@@ -943,7 +983,9 @@ function sseState(force) {
     open: S.trades.map(t => ({ dir: t.dir, via: t.via, mode: t.mode, lev: t.lev, entry: t.entry, qty: t.qty, stake: t.stake, pnl: t.pnl, tpLocked: t.tpLocked, sl: t.sl, tp: t.tp })),
     closedN: S.closed.length, wins, wr: S.closed.length ? Math.round(100 * wins / S.closed.length) : null,
     viaStats,
-    lastClosed: S.closed.slice(-8).reverse().map(t => ({ dir: t.dir, via: t.via, pnl: t.pnl, reason: t.reason }))
+    lastClosed: S.closed.slice(-8).reverse().map(t => ({ dir: t.dir, via: t.via, pnl: t.pnl, reason: t.reason })),
+    lastDiag: S.diag.length ? S.diag[S.diag.length - 1] : null,
+    funnelTop: Object.entries(S.funnel).sort((a, b) => b[1] - a[1]).slice(0, 3)
   }});
 }
 
@@ -955,12 +997,33 @@ app.get('/api/stream', (req, res) => {
   req.on('close', () => sseClients.delete(res));
 });
 
+// DIAGNOSTIC : pourquoi le bot n'entre pas — entonnoir complet + 30 derniers verdicts
+app.get('/api/why', (req, res) => {
+  res.status(200).json({
+    ok: true, mode: ENGINE_MODE, running: S.running, regime: S.regime, adx: +S.adx.toFixed(1),
+    clotures_analysees: Object.values(S.funnel).reduce((a, b) => a + b, 0),
+    entonnoir: Object.fromEntries(Object.entries(S.funnel).sort((a, b) => b[1] - a[1])),
+    lexique: {
+      RANGE_CALME: 'prix DANS les bandes de Bollinger, RSI moyen — aucun exces a inverser',
+      RANGE_BANDE_OK_RSI_TIEDE: 'cloture HORS bande 2σ mais RSI hors bornes 38/62 (voir champ rsi)',
+      'RANGE_QMR<35_(x)': 'setup present mais qualite x sous le plancher decrete Q35',
+      RANGE_RSI_OK_DANS_BANDES: 'RSI extreme mais prix revenu DANS les bandes a la cloture',
+      TREND_DIR_NEUTRE: 'momentum et EMA en desaccord — pas de direction franche',
+      TREND_DIR_OPPOSEE: 'signal CONTRE le regime (ex: rebond haussier en regime DOWN) — refuse par design',
+      'TREND_Q<50': 'direction alignee au regime mais qualite insuffisante',
+      TREND_SANS_PULLBACK: 'tendance en extension — pas de retour sur EMA21 a jouer',
+      TREND_SANS_REPRISE: 'pullback present mais la reprise dans le sens du regime manque encore'
+    },
+    derniers_verdicts: S.diag.slice(-30).reverse()
+  });
+});
+
 app.get('/api/state', (req, res) => { sseState(true); res.status(200).json({ ok: true, mode: ENGINE_MODE, running: S.running, regime: S.regime, adx: S.adx, price: S.price, open: S.trades.length, closed: S.closed.length }); });
 
 // ═════════════ DASHBOARD INTEGRE (spectateur pur — AUCUNE cle, AUCUNE logique) ═════════════
 const DASH_HTML = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Itachi v6 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
+<title>Itachi v6.2 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
 <style>
 :root{--bg:#0a0e14;--surface:#111722;--border:#1d2635;--text:#e6edf3;--muted:#7d8ba1;--teal:#00f5c8;--red:#ff3056;--yellow:#ffc94d}
 *{box-sizing:border-box;margin:0;padding:0}body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',ui-monospace,monospace;font-size:13px;padding:14px}
@@ -978,7 +1041,7 @@ h3{font-size:10px;color:var(--muted);letter-spacing:2px;margin:14px 0 6px}
 .jl-sys{color:var(--muted)}.jl-buy{color:var(--teal)}.jl-sell{color:var(--red)}.jl-info{color:var(--yellow)}
 </style></head><body>
 <div class="top">
-  <span class="logo">CryptoSignal<b>AI</b> <span class="mut" style="font-weight:400;font-size:11px">/ Itachi v6 SERVER · Srv 4.0 · WR: à mesurer</span></span>
+  <span class="logo">CryptoSignal<b>AI</b> <span class="mut" style="font-weight:400;font-size:11px">/ Itachi v6.2 SERVER · Srv 4.0 · WR: à mesurer · RANGE Q35</span></span>
   <span class="badge" id="bMode">—</span><span class="badge" id="bRegime">—</span><span class="badge" id="bRun">—</span>
 </div>
 <div class="grid">
@@ -989,6 +1052,7 @@ h3{font-size:10px;color:var(--muted);letter-spacing:2px;margin:14px 0 6px}
   <div class="card"><div class="lbl">OUVERTES</div><div class="val yel" id="vOpen">0</div></div>
   <div class="card"><div class="lbl">FERMÉES</div><div class="val" id="vClosed">0</div></div>
   <div class="card"><div class="lbl">WIN RATE</div><div class="val teal" id="vWR">—</div></div>
+  <div class="card" style="grid-column:span 2"><div class="lbl">DERNIER VERDICT — POURQUOI PAS D'ENTRÉE</div><div class="val yel" style="font-size:11px" id="vWhy">—</div></div>
 </div>
 <h3>POSITIONS OUVERTES</h3>
 <div class="card"><table><thead><tr><th>SENS</th><th>VIA</th><th>MODE</th><th>LEV</th><th>ENTRÉE</th><th>QTY</th><th>SL</th><th>SORTIE</th><th>P&L</th></tr></thead><tbody id="tOpen"><tr><td colspan="9" class="mut">Aucune position</td></tr></tbody></table></div>
@@ -1017,6 +1081,7 @@ function render(s){
   $('vNet').textContent=s.netReel?money(s.netReel.net):'—';
   if(s.netReel)$('vNet').className='val '+(s.netReel.net>=0?'teal':'red');
   $('vOpen').textContent=s.open.length;$('vClosed').textContent=s.closedN;
+  if(s.lastDiag)$('vWhy').textContent=s.lastDiag.verdict+(s.lastDiag.rsi!=null?' · RSI '+s.lastDiag.rsi:'')+(s.funnelTop&&s.funnelTop.length?'  |  cumul: '+s.funnelTop.map(x=>x[0]+'×'+x[1]).join(' · '):'');
   $('vWR').textContent=s.wr==null?'—':s.wr+'%';
   $('tOpen').innerHTML=s.open.length?s.open.map(t=>'<tr><td class="'+(t.dir==='LONG'?'teal':'red')+'">'+t.dir+'</td><td>'+t.via+'</td><td>'+(t.mode==='RANGE'?'◆ MR':t.tpLocked?'🟢 TRAIL':'⏳')+'</td><td>x'+t.lev+'</td><td>'+fp(t.entry,1)+'</td><td>'+t.qty+'</td><td>'+fp(t.sl,1)+'</td><td>'+fp(t.tp,1)+'</td><td class="'+(t.pnl>=0?'teal':'red')+'">'+money(t.pnl)+'</td></tr>').join(''):'<tr><td colspan="9" class="mut">Aucune position</td></tr>';
   const vs=Object.entries(s.viaStats||{});
@@ -1033,14 +1098,14 @@ app.get('/', (req, res) => {
   res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(DASH_HTML);
 });
-app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v6.0-server-engine', engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream'] }));
+app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v6.2-calme-q35', engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
 
 // ═════════════ DEMARRAGE MOTEUR ═════════════
 async function startEngine() {
   if (ENGINE_MODE === 'off') { console.log('[BOT] ENGINE_MODE=off — serveur en mode PROXY PUR (comportement v3.5). Regler ENGINE_MODE=paper|live + cles pour activer.'); return; }
   if (ENGINE_MODE === 'live' && (!E_KEY || !E_SECRET)) { console.log('[BOT] ⛔ ENGINE_MODE=live mais BINANCE_API_KEY/SECRET absentes — moteur NON demarre.'); return; }
   try {
-    jlog('sys', `🚀 Itachi v6 SERVER · Srv 4.0 · WR: a mesurer — ${ENGINE_MODE.toUpperCase()} ${ENGINE_NET.toUpperCase()} ${SYMBOL} — MULTI-REGIME ADX(14) 5m · SL -0.8% · TREND: trail natif +1.6%/-0.5% · RANGE: TP fixe +0.7% · MIN_GAP 1min30 · MAX 2 meme sens (0.3%) · KILL -${(P.CAP*P.KILL).toFixed(0)}$ reel`);
+    jlog('sys', `🚀 Itachi v6 SERVER · Srv 4.0 · WR: a mesurer — ${ENGINE_MODE.toUpperCase()} ${ENGINE_NET.toUpperCase()} ${SYMBOL} — MULTI-REGIME ADX(14) 5m · SL -0.8% · TREND: trail natif +1.6%/-0.5% · RANGE assoupli (RSI 38/62, plancher QMR>=35 — decret Q35): TP fixe +0.7% · MIN_GAP 1min30 · MAX 2 meme sens (0.3%) · KILL -${(P.CAP*P.KILL).toFixed(0)}$ reel`);
     await seedCandles();
     if (ENGINE_MODE === 'live') {
       const bal = await bnCall(E_BASE, '/fapi/v2/balance', 'GET', {}, E_KEY, E_SECRET);
@@ -1088,9 +1153,12 @@ if (process.argv.includes('--selftest')) {
     assert(classifyRegime(calcADX(trendDn, 14)) === 'DOWN', 'classifyRegime : DOWN correct');
     // QMR : plus l extreme est marque, plus Q monte
     const bbT = { mid: 100, up: 102, lo: 98, sd: 1 };
-    const qFaible = calcQMR('LONG', 98.0, bbT, 32);   // limite pile
-    const qFort   = calcQMR('LONG', 97.0, bbT, 15);   // RSI 15 + 1σ sous la bande
-    assert(qFaible === 20 && qFort > 80, `QMR gradue : limite=${qFaible}, extreme=${qFort}`);
+    const qSeuil  = calcQMR('LONG', 98.0, bbT, 32);   // RSI 32 pile sur la bande → doit valoir EXACTEMENT le plancher
+    const qRejet  = calcQMR('LONG', 98.0, bbT, 38);   // RSI 38 sans exces de bande → sous le plancher
+    const qFort   = calcQMR('LONG', 97.0, bbT, 15);   // RSI 15 + 1σ sous la bande → maximal
+    assert(qSeuil === QMR_MIN, `QMR : RSI 32 sur bande = ${qSeuil} = plancher ${QMR_MIN} (decret Q35)`);
+    assert(qRejet < QMR_MIN, `QMR : RSI 38 sans exces = ${qRejet} < ${QMR_MIN} → refuse`);
+    assert(qFort === 99, `QMR extreme = ${qFort}`);
     // Grille decrets
     assert(getLev(40) === 3 && getLev(60) === 7 && getLev(85) === 12, 'Leviers 3/7/12 par Q');
     assert(getStake(40) === 50 && getStake(60) === 67.5 && getStake(85) === 87.5, 'Mises 50/67.5/87.5 par Q');
@@ -1105,4 +1173,3 @@ if (process.argv.includes('--selftest')) {
 if (!process.argv.includes('--selftest')) {
   app.listen(PORT, () => console.log(`Itachi BOT-BTC v6.0 (Srv 4.0 — proxy + moteur ${ENGINE_MODE.toUpperCase()}) en ecoute sur le port ${PORT}`));
 }
-
