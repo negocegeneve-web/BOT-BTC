@@ -232,7 +232,7 @@ app.post('/api/pnl-reel', async (req, res) => {
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v6.2-calme-q35', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v6.3-force30', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -413,6 +413,16 @@ const ADX_PERIOD = 14, ADX_TREND = 20;
 // ── DECRET 05/07 « marche calme, Q35 ok » ──
 const RSI_LO = 38, RSI_HI = 62;    // bornes RSI assouplies en RANGE (etaient 32/68)
 const QMR_MIN = 35;                // plancher de qualite mean-reversion decrete
+// ── DECRET 05/07 « MODE RELANCE » : pas d'entree en 30 min → entree forcee ──
+//  Geometrie EV-neutre a WR 50% : gagnant net +0.6%, perdant net -0.6% (frais 0.10% inclus)
+//  Interrupteur SANS redeploiement : variable Railway FORCE_MODE=off
+const FORCE_MODE     = (process.env.FORCE_MODE || 'on').toLowerCase() !== 'off';
+const FORCE_AFTER_MS = (parseInt(process.env.FORCE_AFTER_MIN || '30') || 30) * 60000;
+const FORCE_TP  = 0.007;           // TP fixe +0.7% (TAKE_PROFIT_MARKET natif)
+const FORCE_SL  = 0.005;           // SL -0.5% (STOP_MARKET natif)
+const FORCE_LEV = 12;              // decret : haut levier
+const FORCE_STAKE_Q = 0;           // qualite nulle par definition → mise de base de la grille (50$)
+const FORCE_TIMEOUT_MS = (parseInt(process.env.FORCE_TIMEOUT_MIN || '30') || 30) * 60000; // sortie rapide : time-stop
 const QTY_DEC = SYMBOL === 'BTCUSDT' ? 3 : 0;      // precision quantite
 const PX_DEC  = SYMBOL === 'BTCUSDT' ? 1 : 2;      // precision prix
 
@@ -675,6 +685,15 @@ function onCandleClose(k) {
       else                                       blocked = 'RANGE_CALME';
     } else blocked = 'RANGE_INDIC_PAS_PRETS';
   }
+  // ── DECRET MODE RELANCE : 30 min sans entree + a plat → entree forcee au micro-biais ──
+  if (!wantDir && FORCE_MODE && S.regime !== 'WARMUP' && S.trades.length === 0
+      && Date.now() - S.lastEntry >= FORCE_AFTER_MS) {
+    const dirF = S.pdi > S.ndi ? 'LONG' : S.ndi > S.pdi ? 'SHORT' : (close >= (sig.es || close) ? 'LONG' : 'SHORT');
+    jlog('buy', `⚡ MODE RELANCE — ${Math.round(FORCE_AFTER_MS/60000)} min sans entree → entree forcee ${dirF} (biais +DI ${S.pdi.toFixed(1)} / -DI ${S.ndi.toFixed(1)}) | x${FORCE_LEV} | TP +${(FORCE_TP*100).toFixed(1)}% / SL -${(FORCE_SL*100).toFixed(1)}% / time-stop ${Math.round(FORCE_TIMEOUT_MS/60000)}min`);
+    recordDiag(k, sig, dx, 'ENTREE_FORCE-30min');
+    openPosition(dirF, close, FORCE_LEV, FORCE_STAKE_Q, 'FORCE-30min', 'FORCE');
+    return;
+  }
   if (!wantDir) return recordDiag(k, sig, dx, blocked || 'AUCUN_SETUP');
 
   // Decret MIN_GAP 1min30
@@ -714,8 +733,8 @@ async function openPosition(dir, price, lev, q, via, mode) {
   const stake = getStake(q);
   const qty = Math.floor((stake * lev / price) * Math.pow(10, QTY_DEC)) / Math.pow(10, QTY_DEC);
   if (qty <= 0) { jlog('sell', '⚠ Quantite nulle — entree annulee'); return; }
-  const SL_PCT = P.SL;
-  const TP_PCT = mode === 'RANGE' ? P.TP_RANGE : P.TP;
+  const SL_PCT = mode === 'FORCE' ? FORCE_SL : P.SL;
+  const TP_PCT = mode === 'FORCE' ? FORCE_TP : mode === 'RANGE' ? P.TP_RANGE : P.TP;
   const sl = dir === 'LONG' ? price * (1 - SL_PCT) : price * (1 + SL_PCT);
   const tp = dir === 'LONG' ? price * (1 + TP_PCT) : price * (1 - TP_PCT);
 
@@ -764,7 +783,7 @@ async function openPosition(dir, price, lev, q, via, mode) {
     if (slO && slO.orderId) { t.bnIds.sl = slO.orderId; t.bnIds.slAlgo = !!slO.algo; }
 
     // Sortie native selon le mode
-    const tpO = mode === 'RANGE'
+    const tpO = (mode === 'RANGE' || mode === 'FORCE')
       ? await placeConditional(E_BASE, { symbol: SYMBOL, side: closeSide, type: 'TAKE_PROFIT_MARKET',
           stopPrice: tp.toFixed(PX_DEC), quantity: qtyStr, reduceOnly: 'true' }, E_KEY, E_SECRET)
       : await placeConditional(E_BASE, { symbol: SYMBOL, side: closeSide, type: 'TRAILING_STOP_MARKET',
@@ -772,7 +791,7 @@ async function openPosition(dir, price, lev, q, via, mode) {
           quantity: qtyStr, reduceOnly: 'true' }, E_KEY, E_SECRET);
     if (tpO && tpO.orderId) { t.bnIds.tp = tpO.orderId; t.bnIds.tpAlgo = !!tpO.algo; }
 
-    const exitLbl = mode === 'RANGE' ? `TP FIXE ${tp.toFixed(PX_DEC)}` : `TRAILING natif (arm ${tp.toFixed(PX_DEC)}, cb ${(P.TRAIL*100).toFixed(1)}%)`;
+    const exitLbl = (mode === 'RANGE' || mode === 'FORCE') ? `TP FIXE ${tp.toFixed(PX_DEC)}` : `TRAILING natif (arm ${tp.toFixed(PX_DEC)}, cb ${(P.TRAIL*100).toFixed(1)}%)`;
     if (t.bnIds.sl && t.bnIds.tp) jlog('sys', `✅ SL ${sl.toFixed(PX_DEC)} + ${exitLbl} poses cote Binance`);
     else jlog('sell', `⚠ Protection PARTIELLE — SL:${t.bnIds.sl ? 'OK' : 'ECHEC'} SORTIE:${t.bnIds.tp ? 'OK' : 'ECHEC'}`);
 
@@ -829,7 +848,11 @@ function paperManage() {
     const pct = t.dir === 'LONG' ? (price - t.entry) / t.entry : (t.entry - price) / t.entry;
     if (pct > t.bestPricePct) t.bestPricePct = pct;
     t.pnl = pct * t.stake * t.lev - t.stake * t.lev * P.FEE_SIDE * 2;
-    if (t.mode === 'RANGE') {
+    if (t.mode === 'FORCE') {
+      if (pct <= -FORCE_SL)   { closePosition(t, price, `🔴 SL relance -${(FORCE_SL*100).toFixed(1)}%`, false); continue; }
+      if (pct >= FORCE_TP)    { closePosition(t, price, `✅ TP relance +${(FORCE_TP*100).toFixed(1)}%`, false); continue; }
+      if (Date.now() - t.openTime >= FORCE_TIMEOUT_MS) { closePosition(t, price, `⏱ Time-stop relance ${Math.round(FORCE_TIMEOUT_MS/60000)}min`, false); continue; }
+    } else if (t.mode === 'RANGE') {
       if (pct <= -P.SL)       { closePosition(t, price, `🔴 SL -${(P.SL*100).toFixed(1)}%`, false); continue; }
       if (pct >= P.TP_RANGE)  { closePosition(t, price, `✅ TP fixe +${(P.TP_RANGE*100).toFixed(1)}%`, false); continue; }
     } else {
@@ -938,11 +961,14 @@ async function pollLoop() {
     paperManage();
     // Suivi PnL live affichage (les sorties LIVE sont executees par Binance)
     if (ENGINE_MODE === 'live') {
-      for (const t of S.trades) {
+      for (const t of [...S.trades]) {
         const pct = t.dir === 'LONG' ? (S.price - t.entry) / t.entry : (t.entry - S.price) / t.entry;
         if (pct > t.bestPricePct) t.bestPricePct = pct;
-        if (t.mode !== 'RANGE' && !t.tpLocked && pct >= P.TP) { t.tpLocked = true; jlog('info', `🟢 TRAIL ARME ${t.dir} (suivi par BINANCE natif)`); }
+        if (t.mode === 'TREND' && !t.tpLocked && pct >= P.TP) { t.tpLocked = true; jlog('info', `🟢 TRAIL ARME ${t.dir} (suivi par BINANCE natif)`); }
         t.pnl = pct * t.stake * t.lev - t.stake * t.lev * P.FEE_SIDE * 2;
+        if (t.mode === 'FORCE' && Date.now() - t.openTime >= FORCE_TIMEOUT_MS) {
+          await closePosition(t, S.price, `⏱ Time-stop relance ${Math.round(FORCE_TIMEOUT_MS/60000)}min`, true);
+        }
       }
     }
     S.ticks++;
@@ -1012,7 +1038,8 @@ app.get('/api/why', (req, res) => {
       TREND_DIR_OPPOSEE: 'signal CONTRE le regime (ex: rebond haussier en regime DOWN) — refuse par design',
       'TREND_Q<50': 'direction alignee au regime mais qualite insuffisante',
       TREND_SANS_PULLBACK: 'tendance en extension — pas de retour sur EMA21 a jouer',
-      TREND_SANS_REPRISE: 'pullback present mais la reprise dans le sens du regime manque encore'
+      TREND_SANS_REPRISE: 'pullback present mais la reprise dans le sens du regime manque encore',
+      'ENTREE_FORCE-30min': 'MODE RELANCE (decret) : 30 min sans entree, a plat → entree forcee au biais DI, x12, TP+0.7/SL-0.5/time-stop'
     },
     derniers_verdicts: S.diag.slice(-30).reverse()
   });
@@ -1023,7 +1050,7 @@ app.get('/api/state', (req, res) => { sseState(true); res.status(200).json({ ok:
 // ═════════════ DASHBOARD INTEGRE (spectateur pur — AUCUNE cle, AUCUNE logique) ═════════════
 const DASH_HTML = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Itachi v6.2 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
+<title>Itachi v6.3 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
 <style>
 :root{--bg:#0a0e14;--surface:#111722;--border:#1d2635;--text:#e6edf3;--muted:#7d8ba1;--teal:#00f5c8;--red:#ff3056;--yellow:#ffc94d}
 *{box-sizing:border-box;margin:0;padding:0}body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',ui-monospace,monospace;font-size:13px;padding:14px}
@@ -1041,7 +1068,7 @@ h3{font-size:10px;color:var(--muted);letter-spacing:2px;margin:14px 0 6px}
 .jl-sys{color:var(--muted)}.jl-buy{color:var(--teal)}.jl-sell{color:var(--red)}.jl-info{color:var(--yellow)}
 </style></head><body>
 <div class="top">
-  <span class="logo">CryptoSignal<b>AI</b> <span class="mut" style="font-weight:400;font-size:11px">/ Itachi v6.2 SERVER · Srv 4.0 · WR: à mesurer · RANGE Q35</span></span>
+  <span class="logo">CryptoSignal<b>AI</b> <span class="mut" style="font-weight:400;font-size:11px">/ Itachi v6.3 SERVER · Srv 4.0 · WR: à mesurer · Q35 + RELANCE 30min</span></span>
   <span class="badge" id="bMode">—</span><span class="badge" id="bRegime">—</span><span class="badge" id="bRun">—</span>
 </div>
 <div class="grid">
@@ -1098,14 +1125,14 @@ app.get('/', (req, res) => {
   res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(DASH_HTML);
 });
-app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v6.2-calme-q35', engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
+app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v6.3-force30', engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
 
 // ═════════════ DEMARRAGE MOTEUR ═════════════
 async function startEngine() {
   if (ENGINE_MODE === 'off') { console.log('[BOT] ENGINE_MODE=off — serveur en mode PROXY PUR (comportement v3.5). Regler ENGINE_MODE=paper|live + cles pour activer.'); return; }
   if (ENGINE_MODE === 'live' && (!E_KEY || !E_SECRET)) { console.log('[BOT] ⛔ ENGINE_MODE=live mais BINANCE_API_KEY/SECRET absentes — moteur NON demarre.'); return; }
   try {
-    jlog('sys', `🚀 Itachi v6 SERVER · Srv 4.0 · WR: a mesurer — ${ENGINE_MODE.toUpperCase()} ${ENGINE_NET.toUpperCase()} ${SYMBOL} — MULTI-REGIME ADX(14) 5m · SL -0.8% · TREND: trail natif +1.6%/-0.5% · RANGE assoupli (RSI 38/62, plancher QMR>=35 — decret Q35): TP fixe +0.7% · MIN_GAP 1min30 · MAX 2 meme sens (0.3%) · KILL -${(P.CAP*P.KILL).toFixed(0)}$ reel`);
+    jlog('sys', `🚀 Itachi v6 SERVER · Srv 4.0 · WR: a mesurer — ${ENGINE_MODE.toUpperCase()} ${ENGINE_NET.toUpperCase()} ${SYMBOL} — MULTI-REGIME ADX(14) 5m · SL -0.8% · TREND: trail natif +1.6%/-0.5% · RANGE assoupli (RSI 38/62, plancher QMR>=35 — decret Q35): TP fixe +0.7% · MIN_GAP 1min30 · MAX 2 meme sens (0.3%) · RELANCE 30min (biais DI, x12, TP+0.7/SL-0.5, time-stop, FORCE_MODE=off pour couper) · KILL -${(P.CAP*P.KILL).toFixed(0)}$ reel`);
     await seedCandles();
     if (ENGINE_MODE === 'live') {
       const bal = await bnCall(E_BASE, '/fapi/v2/balance', 'GET', {}, E_KEY, E_SECRET);
@@ -1117,6 +1144,7 @@ async function startEngine() {
       jlog('sys', `📝 PAPER — capital simule $${S.paperCap.toFixed(2)}, prix reels, AUCUN ordre envoye`);
     }
     S.running = true; S.startedAt = Date.now(); S.lastHb = Date.now();
+    S.lastEntry = Date.now();   // arme l'horloge du MODE RELANCE a partir du demarrage
     setInterval(pollLoop, 4000);
     if (ENGINE_MODE === 'live') { setInterval(reconcile, 9000); setInterval(refreshNetReel, 30000); refreshNetReel(); }
     jlog('sys', '🔁 Boucle prix 4s active — decisions sur clotures 1m officielles | Binance = source de verite (9s)');
@@ -1162,6 +1190,12 @@ if (process.argv.includes('--selftest')) {
     // Grille decrets
     assert(getLev(40) === 3 && getLev(60) === 7 && getLev(85) === 12, 'Leviers 3/7/12 par Q');
     assert(getStake(40) === 50 && getStake(60) === 67.5 && getStake(85) === 87.5, 'Mises 50/67.5/87.5 par Q');
+    // MODE RELANCE : geometrie EV-neutre exacte a WR 50% (frais 0.10% aller-retour inclus)
+    const winNet  = FORCE_TP - 2 * P.FEE_SIDE;   // +0.6%
+    const lossNet = FORCE_SL + 2 * P.FEE_SIDE;   // -0.6%
+    const wrEquilibre = lossNet / (winNet + lossNet);
+    assert(Math.abs(wrEquilibre - 0.5) < 1e-9, `RELANCE : WR d'equilibre = ${(wrEquilibre*100).toFixed(1)}% (EV-neutre au coin-flip)`);
+    assert(getStake(FORCE_STAKE_Q) === 50, 'RELANCE : mise de base 50$ (Q=0)');
     console.log(ok ? '\n════ SELFTEST COMPLET : TOUT PASSE ════' : '\n════ SELFTEST : ECHECS DETECTES ════');
     process.exit(ok ? 0 : 1);
   })();
