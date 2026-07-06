@@ -232,7 +232,7 @@ app.post('/api/pnl-reel', async (req, res) => {
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v7.0-close', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v7.1-controls', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -429,7 +429,7 @@ const PX_DEC  = SYMBOL === 'BTCUSDT' ? 1 : 2;      // precision prix
 // ── ETAT MOTEUR ──
 const S = {
   running: false, killed: false,
-  price: 0, priceChg24h: 0, chg24: null, pnlLow: 0, forceReq: 0,
+  price: 0, priceChg24h: 0, chg24: null, pnlLow: 0, forceReq: 0, paused: false,
   candles1m: [],               // clotures 1m {t,h,l,c} (max 240)
   candles5m: [], cur5: null,   // bougies 5m {h,l,c} pour ADX
   lastClosed1m: 0,             // openTime de la derniere 1m traitee
@@ -641,6 +641,7 @@ function onCandleClose(k) {
                bbUp: bb ? +((k.c - bb.up) / bb.up * 100).toFixed(3) : null };
 
   if (!S.running || S.killed)        return recordDiag(k, sig, dx, S.killed ? 'KILL' : 'ARRETE');
+  if (S.paused)                      return recordDiag(k, sig, dx, 'PAUSE');   // entrees bloquees, positions gerees
   if (S.trades.length >= P.MAX_OP)   return recordDiag(k, sig, dx, 'MAX_POSITIONS');
 
   const close = k.c;
@@ -1027,7 +1028,7 @@ function sseState(force) {
   if (pnlTot < S.pnlLow) S.pnlLow = pnlTot;
   const s9 = {
     mode: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, killed: S.killed,
-    armed: !!(E_KEY && E_SECRET),
+    armed: !!(E_KEY && E_SECRET), paused: S.paused,
     price: S.price, chg24: S.chg24, regime: S.regime, adx: S.adx, pdi: S.pdi, ndi: S.ndi,
     sigQ: S.sigQ, sigDir: S.sigDir,
     relance: { inMs: Math.max(0, (S.lastEntry + FORCE_AFTER_MS) - Date.now()),
@@ -1104,10 +1105,24 @@ app.post('/api/engine/stop', (req, res) => {
   const { keyPrefix } = req.body || {};
   if (!E_KEY || !keyPrefix || String(keyPrefix).length < 8 || !E_KEY.startsWith(String(keyPrefix)))
     return res.status(403).json({ ok: false, error: 'verification refusee (prefixe de cle)' });
-  S.running = false;
-  jlog('sys', '⏹ Moteur arrete depuis la page — les SL/TP natifs des positions restent VIVANTS chez Binance');
+  S.running = false; S.paused = false;
+  E_KEY = ''; E_SECRET = '';   // ARRET total : cles effacees de la RAM — re-armer pour reprendre
+  jlog('sys', '⏹ ARRET TOTAL — cles effacees de la RAM. Les SL/TP natifs des positions restent VIVANTS chez Binance.');
   sseState(true);
   res.status(200).json({ ok: true, running: false });
+});
+
+// ⏸/▶ PAUSE des entrees (les positions ouvertes restent gerees, flux et exits actifs)
+app.post('/api/engine/pause', (req, res) => {
+  const { keyPrefix, pause } = req.body || {};
+  if (!E_KEY || !keyPrefix || String(keyPrefix).length < 8 || !E_KEY.startsWith(String(keyPrefix)))
+    return res.status(403).json({ ok: false, error: 'verification refusee (prefixe de cle)' });
+  if (!S.running) return res.status(409).json({ ok: false, error: 'moteur non arme' });
+  S.paused = !!pause;
+  jlog('sys', S.paused ? '⏸ PAUSE — nouvelles entrees bloquees (positions ouvertes toujours gerees)'
+                       : '▶ REPRISE — nouvelles entrees reautorisees');
+  sseState(true);
+  res.status(200).json({ ok: true, paused: S.paused });
 });
 
 // ✋ Fermeture manuelle d'une position (protegee : prefixe de la cle armee)
@@ -1146,7 +1161,7 @@ app.get('/api/state', (req, res) => { sseState(true); res.status(200).json({ ok:
 // ═════════════ DASHBOARD INTEGRE (spectateur pur — AUCUNE cle, AUCUNE logique) ═════════════
 const DASH_HTML = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Itachi v7.0 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
+<title>Itachi v7.1 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
 <style>
 :root{--bg:#05070d;--panel:#0a0e17;--surface:#0e1420;--border:#1a2333;--text:#e6edf3;--muted:#7d8ba1;--muted2:#4a5568;--teal:#37e0b0;--blue:#7b87ff;--gold:#d9a441;--red:#ff3b5c;--yellow:#ffc94d}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1211,7 +1226,7 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
 @media(max-width:900px){.app{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--border)}}
 </style></head><body>
 <div class="topbar">
-  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v7.0 SERVER · Srv 4.0 · WR: à mesurer</span></span>
+  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v7.1 SERVER · Srv 4.0 · WR: à mesurer</span></span>
   <span class="tright">
     <span class="src"><i>●</i> Prix Binance live</span>
     <span class="badge" id="bMode">—</span>
@@ -1245,7 +1260,7 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
   <div class="l" style="font-size:10px;color:var(--muted);letter-spacing:1px">API SECRET</div>
   <input id="kSec" type="password" placeholder="Colle ton secret API" autocomplete="off">
   <button class="btn go" id="bStart">🔐 Connecter + ▶ ARMER LIVE</button>
-  <button class="btn stop" id="bStop">⏹ Arrêter (vérif : 8+ car. de la clé)</button>
+  <button class="btn stop" id="bStop">⏹ ARRÊT total — efface les clés</button>
   <button class="btn" id="bForce" style="background:transparent;color:var(--yellow);border:1px solid var(--yellow)">🖐 Forcer l'entrée — exécute ≤ 1min30 (vérif : clé)</button>
   <div id="kMsg">Moteur non armé — colle tes clés puis ▶ (à refaire après chaque redéploiement Railway)</div>
   <div class="netbox">💰 <b>NET RÉEL Binance (session)</b><br>
@@ -1381,49 +1396,75 @@ function render(s){
     var rdt=t.stake?(100*t.pnl/t.stake):0;
     return '<tr><td class="mut">'+(s.closedN-i)+'</td><td class="'+(t.dir==='LONG'?'teal':'red')+'">'+t.dir+'</td><td>×'+t.lev+'</td><td>'+fp(t.entry,1)+'</td><td>'+fp(t.exit,1)+'</td><td>$'+fp(t.stake,0)+'</td><td class="'+(t.pnl>=0?'teal':'red')+'"><b>'+money(t.pnl)+'</b></td><td class="'+(rdt>=0?'teal':'red')+'">'+(rdt>=0?'+':'')+rdt.toFixed(1)+'%</td><td class="mut">'+(t.reason||'')+'</td><td class="mut">'+dur(t.dur||0)+'</td></tr>'
   }).join(''):'<tr><td colspan="10" class="mut">Aucun trade fermé pour l&#39;instant</td></tr>';
-  if(s.armed&&s.running)$('kMsg').textContent='✅ Moteur ARMÉ et en marche — tu peux fermer cette page, le bot continue.';
+  curPaused=!!s.paused;
+  var b1=$('bStart');
+  if(!s.armed||!s.running){btnMode='arm';b1.innerHTML='🔐 Connecter + ▶ ARMER LIVE';b1.style.background='var(--teal)';b1.style.color='#03211a';b1.style.border='0'}
+  else if(s.paused){btnMode='resume';b1.innerHTML='▶ REPRENDRE — entrées en pause';b1.style.background='transparent';b1.style.color='var(--teal)';b1.style.border='1px solid var(--teal)'}
+  else{btnMode='pause';b1.innerHTML='⏸ PAUSE — bloquer les nouvelles entrées';b1.style.background='transparent';b1.style.color='var(--yellow)';b1.style.border='1px solid var(--yellow)'}
+  if(s.armed&&s.running&&!s.paused)$('kMsg').textContent='✅ Moteur ARMÉ et en marche — tu peux fermer cette page, le bot continue.';
   drawChart();
 }
+var kPref='';
+function pref(){
+  var k=kPref||$('kKey').value.trim().slice(0,16);
+  if(!k||k.length<8){$('kMsg').textContent='Verification : colle les 8+ premiers caracteres de ta cle dans API KEY';return null}
+  return k;
+}
+var btnMode='arm';
 $('bStart').onclick=function(){
-  var k=$('kKey').value.trim(),s2=$('kSec').value.trim();
-  if(!k||!s2){$('kMsg').textContent='Clés manquantes';return}
-  $('kMsg').textContent='Armement en cours...';
-  fetch('/api/engine/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,secret:s2})})
+  if(btnMode==='arm'){
+    var k=$('kKey').value.trim(),s2=$('kSec').value.trim();
+    if(!k||!s2){$('kMsg').textContent='Clés manquantes';return}
+    $('kMsg').textContent='Armement en cours...';
+    fetch('/api/engine/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,secret:s2})})
+    .then(function(r){return r.json()}).then(function(d){
+      $('kMsg').textContent=d.ok?'✅ MOTEUR LIVE ARMÉ — tu peux fermer cette page, le bot continue.':'⚠ '+(d.error||d.hint||'échec')+(d.detail?' — '+d.detail.join(' · '):'');
+      if(d.ok){kPref=k.slice(0,16);$('kKey').value='';$('kSec').value=''}
+    }).catch(function(e){$('kMsg').textContent='⚠ '+e.message});
+    return;
+  }
+  var p=pref();if(!p)return;
+  var goPause=(btnMode==='pause');
+  fetch('/api/engine/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyPrefix:p,pause:goPause})})
   .then(function(r){return r.json()}).then(function(d){
-    $('kMsg').textContent=d.ok?'✅ MOTEUR LIVE ARMÉ — tu peux fermer cette page, le bot continue.':'⚠ '+(d.error||d.hint||'échec')+(d.detail?' — '+d.detail.join(' · '):'');
-    if(d.ok){$('kKey').value='';$('kSec').value=''}
+    $('kMsg').textContent=d.ok?(goPause?'⏸ PAUSE — nouvelles entrees bloquees, positions toujours gerees.':'▶ REPRISE — entrees reautorisees.'):'⚠ '+(d.error||'refus')
   }).catch(function(e){$('kMsg').textContent='⚠ '+e.message})
 };
 $('bStop').onclick=function(){
-  var k=$('kKey').value.trim();
-  if(k.length<8){$('kMsg').textContent='Vérification : colle les 8+ premiers caractères de ta clé dans API KEY, puis ⏹';return}
-  fetch('/api/engine/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyPrefix:k.slice(0,16)})})
+  var p=pref();if(!p)return;
+  if(!confirm('ARRET TOTAL : stopper le moteur et effacer les cles de la RAM ?'))return;
+  fetch('/api/engine/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyPrefix:p})})
   .then(function(r){return r.json()}).then(function(d){
     $('kMsg').textContent=d.ok?'⏹ Moteur arrêté — les SL/TP natifs restent vivants chez Binance.':'⚠ '+(d.error||'refus')
   }).catch(function(e){$('kMsg').textContent='⚠ '+e.message})
 };
+var forceCd=0,FORCE_LBL='🖐 Forcer l&#39;entrée — exécute ≤ 1min30 (vérif : clé)';
 $('bForce').onclick=function(){
-  var k=$('kKey').value.trim();
-  if(k.length<8){$('kMsg').textContent='Verification : colle les 8+ premiers caracteres de ta cle dans API KEY, puis cliquer Forcer';return}
-  fetch('/api/engine/force',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyPrefix:k.slice(0,16)})})
+  var p=pref();if(!p)return;
+  fetch('/api/engine/force',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyPrefix:p})})
   .then(function(r){return r.json()}).then(function(d){
-    $('kMsg').textContent=d.ok?'🖐 Entree forcee demandee — execution a la prochaine cloture 1m (analyse biais DI)':'⚠ '+(d.error||'refus')
+    if(d.ok){forceCd=90;$('kMsg').textContent='🖐 Entree forcee demandee — execution a la prochaine cloture 1m'}
+    else{$('kMsg').textContent='⚠ '+(d.error||'refus')}
   }).catch(function(e){$('kMsg').textContent='⚠ '+e.message})
 };
 $('tOpen').addEventListener('click',function(ev){
   var b=ev.target&&ev.target.closest?ev.target.closest('button[data-id]'):null;
   if(!b)return;
-  var k=$('kKey').value.trim();
-  if(k.length<8){$('kMsg').textContent='Verification : colle les 8+ premiers caracteres de ta cle dans API KEY, puis ✕';return}
+  var p=pref();if(!p)return;
   if(!confirm('Fermer cette position au marche, maintenant ?'))return;
-  fetch('/api/engine/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyPrefix:k.slice(0,16),id:b.getAttribute('data-id')})})
+  fetch('/api/engine/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyPrefix:p,id:b.getAttribute('data-id')})})
   .then(function(r){return r.json()}).then(function(d){
     $('kMsg').textContent=d.ok?'✋ Position fermee au marche — stops natifs annules.':'⚠ '+(d.error||'refus')
   }).catch(function(e){$('kMsg').textContent='⚠ '+e.message})
 });
-var relIn=null,relFlat=true,relPend=false,relOn=true,relSync=0;
+var relIn=null,relFlat=true,relPend=false,relOn=true,relSync=0,curPaused=false;
 setInterval(function(){
+  if(forceCd>0){forceCd--;
+    if(relPend){$('bForce').innerHTML='🖐 exécution dans ≤ '+('0'+Math.floor(forceCd/60)).slice(-2)+':'+('0'+forceCd%60).slice(-2)}
+    else{forceCd=0;$('bForce').innerHTML=FORCE_LBL}
+  } else if($('bForce').innerHTML.indexOf('exécution')>=0){$('bForce').innerHTML=FORCE_LBL}
   var el=$('sRel');if(!el)return;
+  if(curPaused){el.textContent='⏸ pause';el.style.color='var(--muted)';return}
   if(!relOn){el.textContent='OFF';el.style.color='var(--muted)';return}
   if(relPend){el.textContent='🖐 demandée';el.style.color='var(--yellow)';return}
   if(!relFlat){el.textContent='position ouverte';el.style.color='var(--muted)';el.style.fontSize='13px';return}
@@ -1458,7 +1499,7 @@ app.get('/', (req, res) => {
   res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(DASH_HTML);
 });
-app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v7.0-close', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
+app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v7.1-controls', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
 
 // ═════════════ DEMARRAGE MOTEUR ═════════════
 async function startEngine() {
