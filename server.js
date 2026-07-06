@@ -232,7 +232,7 @@ app.post('/api/pnl-reel', async (req, res) => {
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v6.6-ui', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v6.7-fix', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -991,6 +991,7 @@ async function pollLoop() {
 
 // ═════════════ SSE — le dashboard est un SPECTATEUR pur ═════════════
 const sseClients = new Set();
+setInterval(() => { for (const r of sseClients) { try { r.write(': ping\n\n'); } catch (_) {} } }, 15000);
 function sseBroadcast(obj) {
   const line = `data: ${JSON.stringify(obj)}\n\n`;
   for (const res of sseClients) { try { res.write(line); } catch (_) {} }
@@ -1010,7 +1011,7 @@ function sseState(force) {
   const pnlClosed = S.closed.reduce((a, t) => a + t.pnl, 0);
   const pnlTot = pnlClosed + pnlOpen;
   if (pnlTot < S.pnlLow) S.pnlLow = pnlTot;
-  sseBroadcast({ kind: 'state', s: {
+  const s9 = {
     mode: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, killed: S.killed,
     armed: !!(E_KEY && E_SECRET),
     price: S.price, chg24: S.chg24, regime: S.regime, adx: S.adx, pdi: S.pdi, ndi: S.ndi,
@@ -1028,11 +1029,13 @@ function sseState(force) {
       exit: t.exit, stake: t.stake, pnl: t.pnl, reason: t.reason, dur: (t.closeTime || 0) - (t.openTime || 0) })),
     lastDiag: S.diag.length ? S.diag[S.diag.length - 1] : null,
     funnelTop: Object.entries(S.funnel).sort((a, b) => b[1] - a[1]).slice(0, 3)
-  }});
+  };
+  sseBroadcast({ kind: 'state', s: s9 });
+  return s9;
 }
 
 app.get('/api/stream', (req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'Access-Control-Allow-Origin': '*' });
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'Access-Control-Allow-Origin': '*', 'X-Accel-Buffering': 'no' });
   res.write(`data: ${JSON.stringify({ kind: 'hello', journal: S.journal.slice(-60) })}\n\n`);
   sseClients.add(res);
   sseState(true);
@@ -1074,7 +1077,8 @@ app.post('/api/engine/start', async (req, res) => {
     jlog('sys', '🔐 Cles recues depuis la page — RAM uniquement, jamais ecrites. Armement LIVE...');
     await startEngine();
     res.status(200).json({ ok: S.running, running: S.running, mode: ENGINE_MODE,
-      hint: S.running ? 'MOTEUR LIVE — tu peux fermer la page' : 'echec armement — voir journal' });
+      hint: S.running ? 'MOTEUR LIVE — tu peux fermer la page' : 'echec armement',
+      detail: S.running ? undefined : S.journal.slice(-2).map(e => e.msg) });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 // Arret protege : exige les premiers caracteres de la cle armee (personne d'autre ne peut arreter ton bot)
@@ -1088,12 +1092,16 @@ app.post('/api/engine/stop', (req, res) => {
   res.status(200).json({ ok: true, running: false });
 });
 
+app.get('/api/snapshot', (req, res) => {
+  res.status(200).json({ ok: true, s: sseState(true) || null, journal: S.journal.slice(-80) });
+});
+
 app.get('/api/state', (req, res) => { sseState(true); res.status(200).json({ ok: true, mode: ENGINE_MODE, running: S.running, regime: S.regime, adx: S.adx, price: S.price, open: S.trades.length, closed: S.closed.length }); });
 
 // ═════════════ DASHBOARD INTEGRE (spectateur pur — AUCUNE cle, AUCUNE logique) ═════════════
 const DASH_HTML = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Itachi v6.6 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
+<title>Itachi v6.7 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
 <style>
 :root{--bg:#05070d;--panel:#0a0e17;--surface:#0e1420;--border:#1a2333;--text:#e6edf3;--muted:#7d8ba1;--muted2:#4a5568;--teal:#37e0b0;--blue:#7b87ff;--gold:#d9a441;--red:#ff3b5c;--yellow:#ffc94d}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1156,7 +1164,7 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
 @media(max-width:900px){.app{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--border)}}
 </style></head><body>
 <div class="topbar">
-  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v6.6 SERVER · Srv 4.0 · WR: à mesurer</span></span>
+  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v6.7 SERVER · Srv 4.0 · WR: à mesurer</span></span>
   <span class="tright">
     <span class="src"><i>●</i> Prix Binance live</span>
     <span class="badge" id="bMode">—</span>
@@ -1275,7 +1283,8 @@ function drawChart(){
   ctx.fillStyle='#d9a441';ctx.fillText('— EMA 21',140,30);
 }
 window.addEventListener('resize',drawChart);
-function addLog(e){jCount++;$('jN').textContent=jCount+' événements';
+var seenLog={};
+function addLog(e){var kk=e.ts+'|'+e.msg;if(seenLog[kk])return;seenLog[kk]=1;jCount++;$('jN').textContent=jCount+' événements';
   var d=new Date(e.ts),t=('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2);
   var div=document.createElement('div');div.className='jl-'+e.type;
   div.innerHTML='<span class="ts">'+t+'</span>'+e.msg.replace(/</g,'&lt;');
@@ -1322,7 +1331,7 @@ function render(s){
   $('tHist').innerHTML=(s.lastClosed&&s.lastClosed.length)?s.lastClosed.map(function(t,i){
     var rdt=t.stake?(100*t.pnl/t.stake):0;
     return '<tr><td class="mut">'+(s.closedN-i)+'</td><td class="'+(t.dir==='LONG'?'teal':'red')+'">'+t.dir+'</td><td>×'+t.lev+'</td><td>'+fp(t.entry,1)+'</td><td>'+fp(t.exit,1)+'</td><td>$'+fp(t.stake,0)+'</td><td class="'+(t.pnl>=0?'teal':'red')+'"><b>'+money(t.pnl)+'</b></td><td class="'+(rdt>=0?'teal':'red')+'">'+(rdt>=0?'+':'')+rdt.toFixed(1)+'%</td><td class="mut">'+(t.reason||'')+'</td><td class="mut">'+dur(t.dur||0)+'</td></tr>'
-  }).join(''):'<tr><td colspan="10" class="mut">Aucun trade fermé pour l\'instant</td></tr>';
+  }).join(''):'<tr><td colspan="10" class="mut">Aucun trade fermé pour l&#39;instant</td></tr>';
   if(s.armed&&s.running)$('kMsg').textContent='✅ Moteur ARMÉ et en marche — tu peux fermer cette page, le bot continue.';
   drawChart();
 }
@@ -1332,7 +1341,7 @@ $('bStart').onclick=function(){
   $('kMsg').textContent='Armement en cours...';
   fetch('/api/engine/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,secret:s2})})
   .then(function(r){return r.json()}).then(function(d){
-    $('kMsg').textContent=d.ok?'✅ MOTEUR LIVE ARMÉ — tu peux fermer cette page, le bot continue.':'⚠ '+(d.error||'échec — voir journal');
+    $('kMsg').textContent=d.ok?'✅ MOTEUR LIVE ARMÉ — tu peux fermer cette page, le bot continue.':'⚠ '+(d.error||d.hint||'échec')+(d.detail?' — '+d.detail.join(' · '):'');
     if(d.ok){$('kKey').value='';$('kSec').value=''}
   }).catch(function(e){$('kMsg').textContent='⚠ '+e.message})
 };
@@ -1344,18 +1353,26 @@ $('bStop').onclick=function(){
     $('kMsg').textContent=d.ok?'⏹ Moteur arrêté — les SL/TP natifs restent vivants chez Binance.':'⚠ '+(d.error||'refus')
   }).catch(function(e){$('kMsg').textContent='⚠ '+e.message})
 };
+var lastStateAt=0;
 var es=new EventSource('/api/stream');
 es.onmessage=function(ev){var d=JSON.parse(ev.data);
   if(d.kind==='hello'&&d.journal)d.journal.slice().reverse().forEach(addLog);
   else if(d.kind==='log')addLog(d.e);
-  else if(d.kind==='state')render(d.s)};
+  else if(d.kind==='state'){lastStateAt=Date.now();render(d.s)}};
+setInterval(function(){
+  if(Date.now()-lastStateAt<6000)return;
+  fetch('/api/snapshot').then(function(r){return r.json()}).then(function(d){
+    if(d.journal)d.journal.forEach(addLog);
+    if(d.s){lastStateAt=Date.now();render(d.s)}
+  }).catch(function(){})
+},4000);
 </script></body></html>`;
 
 app.get('/', (req, res) => {
   res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(DASH_HTML);
 });
-app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v6.6-ui', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
+app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v6.7-fix', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
 
 // ═════════════ DEMARRAGE MOTEUR ═════════════
 async function startEngine() {
