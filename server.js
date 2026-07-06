@@ -232,7 +232,7 @@ app.post('/api/pnl-reel', async (req, res) => {
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v6.3-force30', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v6.5-stakes', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -387,10 +387,10 @@ setInterval(syncTimeAndWarm, 3000);
 // ═══════════════════════════════════════════════════════════════
 
 // ── CONFIGURATION MOTEUR (variables Railway) ──
-const ENGINE_MODE = (process.env.ENGINE_MODE || 'off').toLowerCase();   // off | paper | live
+let ENGINE_MODE = (process.env.ENGINE_MODE || 'off').toLowerCase();   // off | paper | live — passe a 'live' via /api/engine/start
 const ENGINE_NET  = (process.env.ENGINE_NET  || 'mainnet').toLowerCase() === 'testnet' ? 'testnet' : 'mainnet';
-const E_KEY       = process.env.BINANCE_API_KEY    || '';
-const E_SECRET    = process.env.BINANCE_API_SECRET || '';
+let E_KEY       = process.env.BINANCE_API_KEY    || '';   // RAM uniquement via /api/engine/start
+let E_SECRET    = process.env.BINANCE_API_SECRET || '';
 const SYMBOL      = (process.env.SYMBOL || 'BTCUSDT').toUpperCase();
 const E_BASE      = BN_BASES[ENGINE_NET];
 const KLINE_BASE  = BN_BASES.mainnet;              // klines toujours mainnet (testnet = historique pauvre)
@@ -398,7 +398,7 @@ const KLINE_BASE  = BN_BASES.mainnet;              // klines toujours mainnet (t
 // ── PARAMETRES STRATEGIQUES (decrets — IMMUABLES sans backtest/decret) ──
 const P = {
   CAP: parseFloat(process.env.CAPITAL || '500'),
-  STAKE: 50, STAKE_MID: 67.5, STAKE_MAX: 87.5,
+  STAKE: 120, STAKE_MID: 160, STAKE_MAX: 280,   // decret 06/07 : mises relevees (capital ref 1000$)
   MAX_OP: 4,
   LEV_LOW: 3, LEV_MED: 7, LEV_HIGH: 12,
   SL: 0.008, TP: 0.016, TRAIL: 0.005, TP_RANGE: 0.007,
@@ -421,7 +421,7 @@ const FORCE_AFTER_MS = (parseInt(process.env.FORCE_AFTER_MIN || '30') || 30) * 6
 const FORCE_TP  = 0.007;           // TP fixe +0.7% (TAKE_PROFIT_MARKET natif)
 const FORCE_SL  = 0.005;           // SL -0.5% (STOP_MARKET natif)
 const FORCE_LEV = 12;              // decret : haut levier
-const FORCE_STAKE_Q = 0;           // qualite nulle par definition → mise de base de la grille (50$)
+const FORCE_STAKE = 140;           // decret 06/07 : mise fixe du MODE RELANCE = 140$ a chaque fois
 const FORCE_TIMEOUT_MS = (parseInt(process.env.FORCE_TIMEOUT_MIN || '30') || 30) * 60000; // sortie rapide : time-stop
 const QTY_DEC = SYMBOL === 'BTCUSDT' ? 3 : 0;      // precision quantite
 const PX_DEC  = SYMBOL === 'BTCUSDT' ? 1 : 2;      // precision prix
@@ -691,7 +691,7 @@ function onCandleClose(k) {
     const dirF = S.pdi > S.ndi ? 'LONG' : S.ndi > S.pdi ? 'SHORT' : (close >= (sig.es || close) ? 'LONG' : 'SHORT');
     jlog('buy', `⚡ MODE RELANCE — ${Math.round(FORCE_AFTER_MS/60000)} min sans entree → entree forcee ${dirF} (biais +DI ${S.pdi.toFixed(1)} / -DI ${S.ndi.toFixed(1)}) | x${FORCE_LEV} | TP +${(FORCE_TP*100).toFixed(1)}% / SL -${(FORCE_SL*100).toFixed(1)}% / time-stop ${Math.round(FORCE_TIMEOUT_MS/60000)}min`);
     recordDiag(k, sig, dx, 'ENTREE_FORCE-30min');
-    openPosition(dirF, close, FORCE_LEV, FORCE_STAKE_Q, 'FORCE-30min', 'FORCE');
+    openPosition(dirF, close, FORCE_LEV, 0, 'FORCE-30min', 'FORCE');
     return;
   }
   if (!wantDir) return recordDiag(k, sig, dx, blocked || 'AUCUN_SETUP');
@@ -730,7 +730,7 @@ async function ensureLeverage(lev) {
 }
 
 async function openPosition(dir, price, lev, q, via, mode) {
-  const stake = getStake(q);
+  const stake = mode === 'FORCE' ? FORCE_STAKE : getStake(q);   // RELANCE : 140$ fixe (decret)
   const qty = Math.floor((stake * lev / price) * Math.pow(10, QTY_DEC)) / Math.pow(10, QTY_DEC);
   if (qty <= 0) { jlog('sell', '⚠ Quantite nulle — entree annulee'); return; }
   const SL_PCT = mode === 'FORCE' ? FORCE_SL : P.SL;
@@ -1045,12 +1045,39 @@ app.get('/api/why', (req, res) => {
   });
 });
 
+// ── ARMEMENT DEPUIS LA PAGE (decret : cles sur le bot, jamais en variables) ──
+// Les cles arrivent en HTTPS, vivent en RAM du processus, ne sont NI loggees NI ecrites.
+app.post('/api/engine/start', async (req, res) => {
+  try {
+    const { key, secret } = req.body || {};
+    if (!key || !secret || String(key).length < 10 || String(secret).length < 10)
+      return res.status(400).json({ ok: false, error: 'cles manquantes ou invalides' });
+    if (S.running) return res.status(409).json({ ok: false, error: 'moteur deja en marche — arrete-le d abord' });
+    E_KEY = String(key).trim(); E_SECRET = String(secret).trim();
+    ENGINE_MODE = 'live';
+    jlog('sys', '🔐 Cles recues depuis la page — RAM uniquement, jamais ecrites. Armement LIVE...');
+    await startEngine();
+    res.status(200).json({ ok: S.running, running: S.running, mode: ENGINE_MODE,
+      hint: S.running ? 'MOTEUR LIVE — tu peux fermer la page' : 'echec armement — voir journal' });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+// Arret protege : exige les premiers caracteres de la cle armee (personne d'autre ne peut arreter ton bot)
+app.post('/api/engine/stop', (req, res) => {
+  const { keyPrefix } = req.body || {};
+  if (!E_KEY || !keyPrefix || String(keyPrefix).length < 8 || !E_KEY.startsWith(String(keyPrefix)))
+    return res.status(403).json({ ok: false, error: 'verification refusee (prefixe de cle)' });
+  S.running = false;
+  jlog('sys', '⏹ Moteur arrete depuis la page — les SL/TP natifs des positions restent VIVANTS chez Binance');
+  sseState(true);
+  res.status(200).json({ ok: true, running: false });
+});
+
 app.get('/api/state', (req, res) => { sseState(true); res.status(200).json({ ok: true, mode: ENGINE_MODE, running: S.running, regime: S.regime, adx: S.adx, price: S.price, open: S.trades.length, closed: S.closed.length }); });
 
 // ═════════════ DASHBOARD INTEGRE (spectateur pur — AUCUNE cle, AUCUNE logique) ═════════════
 const DASH_HTML = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Itachi v6.3 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
+<title>Itachi v6.5 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
 <style>
 :root{--bg:#0a0e14;--surface:#111722;--border:#1d2635;--text:#e6edf3;--muted:#7d8ba1;--teal:#00f5c8;--red:#ff3056;--yellow:#ffc94d}
 *{box-sizing:border-box;margin:0;padding:0}body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',ui-monospace,monospace;font-size:13px;padding:14px}
@@ -1068,8 +1095,18 @@ h3{font-size:10px;color:var(--muted);letter-spacing:2px;margin:14px 0 6px}
 .jl-sys{color:var(--muted)}.jl-buy{color:var(--teal)}.jl-sell{color:var(--red)}.jl-info{color:var(--yellow)}
 </style></head><body>
 <div class="top">
-  <span class="logo">CryptoSignal<b>AI</b> <span class="mut" style="font-weight:400;font-size:11px">/ Itachi v6.3 SERVER · Srv 4.0 · WR: à mesurer · Q35 + RELANCE 30min</span></span>
+  <span class="logo">CryptoSignal<b>AI</b> <span class="mut" style="font-weight:400;font-size:11px">/ Itachi v6.5 SERVER · Srv 4.0 · WR: à mesurer · mises 120/160/280</span></span>
   <span class="badge" id="bMode">—</span><span class="badge" id="bRegime">—</span><span class="badge" id="bRun">—</span>
+</div>
+<div class="card" style="margin-bottom:12px">
+  <div class="lbl">🔐 ARMEMENT LIVE — clés envoyées UNE fois au moteur (RAM), jamais stockées · pour ARRÊTER : colle les 8+ premiers caractères de ta clé puis ⏹</div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+    <input id="kKey" type="password" placeholder="API KEY" autocomplete="off" style="flex:1;min-width:170px;background:#0a0e14;border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px;font-family:inherit">
+    <input id="kSec" type="password" placeholder="API SECRET" autocomplete="off" style="flex:1;min-width:170px;background:#0a0e14;border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px;font-family:inherit">
+    <button id="bStart" style="background:var(--teal);color:#000;border:0;border-radius:6px;padding:8px 14px;font-weight:700;cursor:pointer;font-family:inherit">▶ ARMER LIVE</button>
+    <button id="bStop" style="background:transparent;color:var(--red);border:1px solid var(--red);border-radius:6px;padding:8px 14px;font-weight:700;cursor:pointer;font-family:inherit">⏹ ARRÊTER</button>
+  </div>
+  <div id="kMsg" class="mut" style="margin-top:6px;font-size:11px">Moteur non armé : colle tes clés puis ▶ (après un redémarrage Railway, ré-armer ici)</div>
 </div>
 <div class="grid">
   <div class="card"><div class="lbl">PRIX</div><div class="val teal" id="vPrice">—</div></div>
@@ -1114,6 +1151,24 @@ function render(s){
   const vs=Object.entries(s.viaStats||{});
   $('tVia').innerHTML=vs.length?vs.map(([v,x])=>'<tr><td>'+v+'</td><td>'+x.n+'</td><td>'+Math.round(100*x.w/x.n)+'%</td><td class="'+(x.pnl>=0?'teal':'red')+'">'+money(x.pnl)+'</td></tr>').join(''):'<tr><td colspan="4" class="mut">En attente des premiers trades</td></tr>';
 }
+$('bStart').onclick=async()=>{
+  const k=$('kKey').value.trim(),s2=$('kSec').value.trim();
+  if(!k||!s2){$('kMsg').textContent='Clés manquantes';return}
+  $('kMsg').textContent='Armement en cours...';
+  try{const r=await fetch('/api/engine/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,secret:s2})});
+    const d=await r.json();
+    $('kMsg').textContent=d.ok?'✅ MOTEUR LIVE ARMÉ — tu peux fermer cette page, le bot continue.':'⚠ '+(d.error||'échec — voir journal');
+    if(d.ok){$('kKey').value='';$('kSec').value='';}
+  }catch(e){$('kMsg').textContent='⚠ '+e.message}
+};
+$('bStop').onclick=async()=>{
+  const k=$('kKey').value.trim();
+  if(k.length<8){$('kMsg').textContent='Vérification : colle les 8+ premiers caractères de ta clé dans le champ API KEY, puis ⏹';return}
+  try{const r=await fetch('/api/engine/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyPrefix:k.slice(0,16)})});
+    const d=await r.json();
+    $('kMsg').textContent=d.ok?'⏹ Moteur arrêté — les SL/TP natifs restent vivants chez Binance.':'⚠ '+(d.error||'refus');
+  }catch(e){$('kMsg').textContent='⚠ '+e.message}
+};
 const es=new EventSource('/api/stream');
 es.onmessage=ev=>{const d=JSON.parse(ev.data);
   if(d.kind==='hello'&&d.journal)d.journal.slice().reverse().forEach(addLog);
@@ -1125,7 +1180,7 @@ app.get('/', (req, res) => {
   res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(DASH_HTML);
 });
-app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v6.3-force30', engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
+app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v6.5-stakes', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
 
 // ═════════════ DEMARRAGE MOTEUR ═════════════
 async function startEngine() {
@@ -1143,10 +1198,15 @@ async function startEngine() {
     } else {
       jlog('sys', `📝 PAPER — capital simule $${S.paperCap.toFixed(2)}, prix reels, AUCUN ordre envoye`);
     }
-    S.running = true; S.startedAt = Date.now(); S.lastHb = Date.now();
+    S.running = true; S.killed = false; S.startedAt = Date.now(); S.lastHb = Date.now();
     S.lastEntry = Date.now();   // arme l'horloge du MODE RELANCE a partir du demarrage
-    setInterval(pollLoop, 4000);
-    if (ENGINE_MODE === 'live') { setInterval(reconcile, 9000); setInterval(refreshNetReel, 30000); refreshNetReel(); }
+    if (!startEngine._timers) { // les boucles ne se creent qu'UNE fois (re-armement sans doublons)
+      startEngine._timers = true;
+      setInterval(pollLoop, 4000);
+      setInterval(reconcile, 9000);         // inerte hors mode live
+      setInterval(refreshNetReel, 30000);   // idem
+    }
+    if (ENGINE_MODE === 'live') refreshNetReel();
     jlog('sys', '🔁 Boucle prix 4s active — decisions sur clotures 1m officielles | Binance = source de verite (9s)');
   } catch (e) {
     jlog('sell', `⛔ Demarrage moteur echoue: ${e.message} — nouvel essai dans 30s`);
@@ -1189,13 +1249,13 @@ if (process.argv.includes('--selftest')) {
     assert(qFort === 99, `QMR extreme = ${qFort}`);
     // Grille decrets
     assert(getLev(40) === 3 && getLev(60) === 7 && getLev(85) === 12, 'Leviers 3/7/12 par Q');
-    assert(getStake(40) === 50 && getStake(60) === 67.5 && getStake(85) === 87.5, 'Mises 50/67.5/87.5 par Q');
+    assert(getStake(40) === 120 && getStake(60) === 160 && getStake(85) === 280, 'Mises 120/160/280 par Q (decret 06/07)');
     // MODE RELANCE : geometrie EV-neutre exacte a WR 50% (frais 0.10% aller-retour inclus)
     const winNet  = FORCE_TP - 2 * P.FEE_SIDE;   // +0.6%
     const lossNet = FORCE_SL + 2 * P.FEE_SIDE;   // -0.6%
     const wrEquilibre = lossNet / (winNet + lossNet);
     assert(Math.abs(wrEquilibre - 0.5) < 1e-9, `RELANCE : WR d'equilibre = ${(wrEquilibre*100).toFixed(1)}% (EV-neutre au coin-flip)`);
-    assert(getStake(FORCE_STAKE_Q) === 50, 'RELANCE : mise de base 50$ (Q=0)');
+    assert(FORCE_STAKE === 140, 'RELANCE : mise fixe 140$ (decret 06/07)');
     console.log(ok ? '\n════ SELFTEST COMPLET : TOUT PASSE ════' : '\n════ SELFTEST : ECHECS DETECTES ════');
     process.exit(ok ? 0 : 1);
   })();
