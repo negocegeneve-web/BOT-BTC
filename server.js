@@ -232,7 +232,7 @@ app.post('/api/pnl-reel', async (req, res) => {
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v6.7-fix', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v7.0-close', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -429,7 +429,7 @@ const PX_DEC  = SYMBOL === 'BTCUSDT' ? 1 : 2;      // precision prix
 // ── ETAT MOTEUR ──
 const S = {
   running: false, killed: false,
-  price: 0, priceChg24h: 0, chg24: null, pnlLow: 0,
+  price: 0, priceChg24h: 0, chg24: null, pnlLow: 0, forceReq: 0,
   candles1m: [],               // clotures 1m {t,h,l,c} (max 240)
   candles5m: [], cur5: null,   // bougies 5m {h,l,c} pour ADX
   lastClosed1m: 0,             // openTime de la derniere 1m traitee
@@ -685,6 +685,19 @@ function onCandleClose(k) {
       else                                       blocked = 'RANGE_CALME';
     } else blocked = 'RANGE_INDIC_PAS_PRETS';
   }
+  // 🖐 ENTREE FORCEE MANUELLE (bouton) — prioritaire sur la relance auto
+  if (S.forceReq) {
+    if (Date.now() - S.forceReq > 180000) {
+      jlog('info', '🖐 Demande d entree forcee EXPIREE (3 min) — portes restees fermees'); S.forceReq = 0;
+    } else if (wantDir) {
+      jlog('info', '🖐 Demande forcee satisfaite par un signal naturel (' + via + ')'); S.forceReq = 0;
+    } else if (S.regime !== 'WARMUP') {
+      const dirM = S.pdi > S.ndi ? 'LONG' : S.ndi > S.pdi ? 'SHORT' : (close >= (sig.es || close) ? 'LONG' : 'SHORT');
+      wantDir = dirM; via = 'FORCE-manuel'; mode = 'FORCE'; qEff = 0;
+      jlog('buy', `🖐 ENTREE FORCEE (bouton) — ${dirM} (biais +DI ${S.pdi.toFixed(1)} / -DI ${S.ndi.toFixed(1)}) | x${FORCE_LEV} | $${FORCE_STAKE} | TP +${(FORCE_TP*100).toFixed(1)}% / SL -${(FORCE_SL*100).toFixed(1)}% / time-stop`);
+    }
+  }
+
   // ── DECRET MODE RELANCE : 30 min sans entree + a plat → entree forcee au micro-biais ──
   if (!wantDir && FORCE_MODE && S.regime !== 'WARMUP' && S.trades.length === 0
       && Date.now() - S.lastEntry >= FORCE_AFTER_MS) {
@@ -718,7 +731,8 @@ function onCandleClose(k) {
   }
 
   recordDiag(k, sig, dx, 'ENTREE_' + via);
-  openPosition(wantDir, close, getLev(qEff), qEff, via, mode);
+  if (via === 'FORCE-manuel') S.forceReq = 0;   // demande consommee
+  openPosition(wantDir, close, mode === 'FORCE' ? FORCE_LEV : getLev(qEff), qEff, via, mode);
 }
 
 // ═════════════ EXECUTION ═════════════
@@ -1016,13 +1030,17 @@ function sseState(force) {
     armed: !!(E_KEY && E_SECRET),
     price: S.price, chg24: S.chg24, regime: S.regime, adx: S.adx, pdi: S.pdi, ndi: S.ndi,
     sigQ: S.sigQ, sigDir: S.sigDir,
+    relance: { inMs: Math.max(0, (S.lastEntry + FORCE_AFTER_MS) - Date.now()),
+               flat: S.trades.length === 0, pending: !!S.forceReq, on: FORCE_MODE },
     closes: S.candles1m.slice(-170).map(c => c.c),
     pnlOpen, pnlClosed, ddPct: S.pnlLow < 0 ? (-S.pnlLow / P.CAP * 100) : 0,
     Pp: { cap: P.CAP, s1: P.STAKE, s2: P.STAKE_MID, s3: P.STAKE_MAX, fs: FORCE_STAKE,
           sl: P.SL, tp: P.TP, tr: P.TRAIL, tpr: P.TP_RANGE, kill: P.CAP * P.KILL },
     cap: P.CAP, paperCap: S.paperCap, wallet: S.walletNow, sessionPnl: S.sessionPnl, unreal: S.unreal,
     netReel: S.netReel,
-    open: S.trades.map(t => ({ dir: t.dir, via: t.via, mode: t.mode, lev: t.lev, entry: t.entry, qty: t.qty, stake: t.stake, pnl: t.pnl, tpLocked: t.tpLocked, sl: t.sl, tp: t.tp })),
+    open: S.trades.map(t => ({ id: t.id, dir: t.dir, via: t.via, mode: t.mode, lev: t.lev, entry: t.entry, qty: t.qty,
+      stake: t.stake, pnl: t.pnl, tpLocked: t.tpLocked, sl: t.sl, tp: t.tp,
+      slOk: !!(t.bnIds && t.bnIds.sl) || ENGINE_MODE === 'paper', tpOk: !!(t.bnIds && t.bnIds.tp) || ENGINE_MODE === 'paper' })),
     closedN: S.closed.length, wins, wr: S.closed.length ? Math.round(100 * wins / S.closed.length) : null,
     viaStats,
     lastClosed: S.closed.slice(-15).reverse().map(t => ({ dir: t.dir, via: t.via, lev: t.lev, entry: t.entry,
@@ -1092,8 +1110,35 @@ app.post('/api/engine/stop', (req, res) => {
   res.status(200).json({ ok: true, running: false });
 });
 
+// ✋ Fermeture manuelle d'une position (protegee : prefixe de la cle armee)
+app.post('/api/engine/close', async (req, res) => {
+  try {
+    const { keyPrefix, id } = req.body || {};
+    if (!E_KEY || !keyPrefix || String(keyPrefix).length < 8 || !E_KEY.startsWith(String(keyPrefix)))
+      return res.status(403).json({ ok: false, error: 'verification refusee (prefixe de cle)' });
+    const t = S.trades.find(x => String(x.id) === String(id));
+    if (!t) return res.status(404).json({ ok: false, error: 'position introuvable (deja fermee ?)' });
+    jlog('sys', `✋ FERMETURE MANUELLE demandee — ${t.dir} ${t.qty} @ marche (stops natifs annules d'abord)`);
+    await closePosition(t, S.price, '✋ Fermeture manuelle', true);
+    res.status(200).json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
 app.get('/api/snapshot', (req, res) => {
   res.status(200).json({ ok: true, s: sseState(true) || null, journal: S.journal.slice(-80) });
+});
+
+// 🖐 Entree forcee a la demande (protegee : prefixe de la cle armee requis)
+app.post('/api/engine/force', (req, res) => {
+  const { keyPrefix } = req.body || {};
+  if (!E_KEY || !keyPrefix || String(keyPrefix).length < 8 || !E_KEY.startsWith(String(keyPrefix)))
+    return res.status(403).json({ ok: false, error: 'verification refusee (prefixe de cle)' });
+  if (!S.running) return res.status(409).json({ ok: false, error: 'moteur non arme' });
+  if (S.forceReq) return res.status(200).json({ ok: true, note: 'demande deja en attente' });
+  S.forceReq = Date.now();
+  jlog('sys', '🖐 ENTREE FORCEE demandee depuis la page — execution a la prochaine cloture 1m (analyse biais DI), fenetre 1min30');
+  sseState(true);
+  res.status(200).json({ ok: true });
 });
 
 app.get('/api/state', (req, res) => { sseState(true); res.status(200).json({ ok: true, mode: ENGINE_MODE, running: S.running, regime: S.regime, adx: S.adx, price: S.price, open: S.trades.length, closed: S.closed.length }); });
@@ -1101,7 +1146,7 @@ app.get('/api/state', (req, res) => { sseState(true); res.status(200).json({ ok:
 // ═════════════ DASHBOARD INTEGRE (spectateur pur — AUCUNE cle, AUCUNE logique) ═════════════
 const DASH_HTML = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Itachi v6.7 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
+<title>Itachi v7.0 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
 <style>
 :root{--bg:#05070d;--panel:#0a0e17;--surface:#0e1420;--border:#1a2333;--text:#e6edf3;--muted:#7d8ba1;--muted2:#4a5568;--teal:#37e0b0;--blue:#7b87ff;--gold:#d9a441;--red:#ff3b5c;--yellow:#ffc94d}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1159,12 +1204,14 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
 .mut{color:var(--muted)}.teal{color:var(--teal)}.red{color:var(--red)}.yel{color:var(--yellow)}.blue{color:var(--blue)}.gold{color:var(--gold)}
 #journal{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 12px;height:230px;overflow-y:auto;font-size:11.5px;line-height:1.9}
 #journal div{white-space:pre-wrap}
+.xbtn{background:transparent;color:var(--red);border:1px solid var(--red);border-radius:6px;padding:2px 9px;font-family:inherit;font-size:11px;font-weight:700;cursor:pointer}
+.xbtn:hover{background:rgba(255,59,92,.12)}
 .jl-sys{color:#8ea8ff}.jl-buy{color:var(--teal)}.jl-sell{color:var(--red)}.jl-info{color:var(--yellow)}
 .ts{color:var(--muted2);margin-right:8px}
 @media(max-width:900px){.app{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--border)}}
 </style></head><body>
 <div class="topbar">
-  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v6.7 SERVER · Srv 4.0 · WR: à mesurer</span></span>
+  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v7.0 SERVER · Srv 4.0 · WR: à mesurer</span></span>
   <span class="tright">
     <span class="src"><i>●</i> Prix Binance live</span>
     <span class="badge" id="bMode">—</span>
@@ -1199,6 +1246,7 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
   <input id="kSec" type="password" placeholder="Colle ton secret API" autocomplete="off">
   <button class="btn go" id="bStart">🔐 Connecter + ▶ ARMER LIVE</button>
   <button class="btn stop" id="bStop">⏹ Arrêter (vérif : 8+ car. de la clé)</button>
+  <button class="btn" id="bForce" style="background:transparent;color:var(--yellow);border:1px solid var(--yellow)">🖐 Forcer l'entrée — exécute ≤ 1min30 (vérif : clé)</button>
   <div id="kMsg">Moteur non armé — colle tes clés puis ▶ (à refaire après chaque redéploiement Railway)</div>
   <div class="netbox">💰 <b>NET RÉEL Binance (session)</b><br>
     Net: <b id="nNet" class="teal">—</b> · brut <span id="nBrut">—</span><br>
@@ -1225,12 +1273,13 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
     <div class="st"><div class="l">🔴 PERDUS</div><div class="v red" id="sL">0</div></div>
     <div class="st"><div class="l">WIN RATE</div><div class="v teal" id="sWR">—</div></div>
     <div class="st"><div class="l">DRAWDOWN MAX</div><div class="v red" id="sDD">0.00%</div></div>
+    <div class="st"><div class="l">⏱ RELANCE DANS</div><div class="v yel" id="sRel">—</div></div>
     <div class="st"><div class="l">PRIX RÉEL</div><div class="v teal" id="sPx">—</div></div>
   </div>
   <section>
     <div class="sechead"><span>POSITIONS</span><span id="posN" class="mut">0 actives</span></div>
-    <table><thead><tr><th>SENS</th><th>VIA</th><th>MODE</th><th>LEV</th><th>ENTRÉE</th><th>QTY</th><th>SL</th><th>SORTIE</th><th>P&L</th></tr></thead>
-    <tbody id="tOpen"><tr><td colspan="9" class="mut">Aucune position</td></tr></tbody></table>
+    <table><thead><tr><th>SENS</th><th>VIA</th><th>MODE</th><th>LEV</th><th>MISE</th><th>ENTRÉE</th><th>QTY</th><th>SL (posé ✓)</th><th>TP (posé ✓)</th><th>P&L</th><th></th></tr></thead>
+    <tbody id="tOpen"><tr><td colspan="11" class="mut">Aucune position</td></tr></tbody></table>
   </section>
   <section>
     <div class="sechead"><span>WIN RATE PAR VOIE (via=)</span></div>
@@ -1322,8 +1371,8 @@ function render(s){
   $('sDD').textContent=(s.ddPct||0).toFixed(2)+'%';
   $('posN').textContent=s.open.length+' actives';
   $('tOpen').innerHTML=s.open.length?s.open.map(function(t){
-    return '<tr><td class="'+(t.dir==='LONG'?'teal':'red')+'"><b>'+t.dir+'</b></td><td class="mut">'+t.via+'</td><td>'+(t.mode==='RANGE'?'◆ MR':t.mode==='FORCE'?'⚡':t.tpLocked?'🟢 TRAIL':'⏳')+'</td><td>×'+t.lev+'</td><td>'+fp(t.entry,1)+'</td><td>'+t.qty+'</td><td class="red">'+fp(t.sl,1)+'</td><td class="teal">'+fp(t.tp,1)+'</td><td class="'+(t.pnl>=0?'teal':'red')+'"><b>'+money(t.pnl)+'</b></td></tr>'
-  }).join(''):'<tr><td colspan="9" class="mut">Aucune position</td></tr>';
+    return '<tr><td class="'+(t.dir==='LONG'?'teal':'red')+'"><b>'+t.dir+'</b></td><td class="mut">'+t.via+'</td><td>'+(t.mode==='RANGE'?'◆ MR':t.mode==='FORCE'?'⚡':t.tpLocked?'🟢 TRAIL':'⏳')+'</td><td>×'+t.lev+'</td><td class="yel">$'+fp(t.stake,0)+'</td><td>'+fp(t.entry,1)+'</td><td>'+t.qty+'</td><td class="red">'+fp(t.sl,1)+(t.slOk?' <span class="teal">✓</span>':' <span class="yel">⏳</span>')+'</td><td class="teal">'+fp(t.tp,1)+(t.tpOk?' <span class="teal">✓</span>':' <span class="yel">⏳</span>')+'</td><td class="'+(t.pnl>=0?'teal':'red')+'"><b>'+money(t.pnl)+'</b></td><td><button class="xbtn" data-id="'+t.id+'" title="Fermer au marche">✕ Fermer</button></td></tr>'
+  }).join(''):'<tr><td colspan="11" class="mut">Aucune position</td></tr>';
   var vs=Object.keys(s.viaStats||{});
   $('tVia').innerHTML=vs.length?vs.map(function(v){var x=s.viaStats[v];
     return '<tr><td>'+v+'</td><td>'+x.n+'</td><td>'+Math.round(100*x.w/x.n)+'%</td><td class="'+(x.pnl>=0?'teal':'red')+'">'+money(x.pnl)+'</td></tr>'
@@ -1353,17 +1402,54 @@ $('bStop').onclick=function(){
     $('kMsg').textContent=d.ok?'⏹ Moteur arrêté — les SL/TP natifs restent vivants chez Binance.':'⚠ '+(d.error||'refus')
   }).catch(function(e){$('kMsg').textContent='⚠ '+e.message})
 };
+$('bForce').onclick=function(){
+  var k=$('kKey').value.trim();
+  if(k.length<8){$('kMsg').textContent='Verification : colle les 8+ premiers caracteres de ta cle dans API KEY, puis cliquer Forcer';return}
+  fetch('/api/engine/force',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyPrefix:k.slice(0,16)})})
+  .then(function(r){return r.json()}).then(function(d){
+    $('kMsg').textContent=d.ok?'🖐 Entree forcee demandee — execution a la prochaine cloture 1m (analyse biais DI)':'⚠ '+(d.error||'refus')
+  }).catch(function(e){$('kMsg').textContent='⚠ '+e.message})
+};
+$('tOpen').addEventListener('click',function(ev){
+  var b=ev.target&&ev.target.closest?ev.target.closest('button[data-id]'):null;
+  if(!b)return;
+  var k=$('kKey').value.trim();
+  if(k.length<8){$('kMsg').textContent='Verification : colle les 8+ premiers caracteres de ta cle dans API KEY, puis ✕';return}
+  if(!confirm('Fermer cette position au marche, maintenant ?'))return;
+  fetch('/api/engine/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyPrefix:k.slice(0,16),id:b.getAttribute('data-id')})})
+  .then(function(r){return r.json()}).then(function(d){
+    $('kMsg').textContent=d.ok?'✋ Position fermee au marche — stops natifs annules.':'⚠ '+(d.error||'refus')
+  }).catch(function(e){$('kMsg').textContent='⚠ '+e.message})
+});
+var relIn=null,relFlat=true,relPend=false,relOn=true,relSync=0;
+setInterval(function(){
+  var el=$('sRel');if(!el)return;
+  if(!relOn){el.textContent='OFF';el.style.color='var(--muted)';return}
+  if(relPend){el.textContent='🖐 demandée';el.style.color='var(--yellow)';return}
+  if(!relFlat){el.textContent='position ouverte';el.style.color='var(--muted)';el.style.fontSize='13px';return}
+  if(relIn==null){el.textContent='—';return}
+  var rem=relIn-(Date.now()-relSync);
+  el.style.fontSize='';
+  if(rem<=0){el.textContent='≤ 1 clôture 1m';el.style.color='var(--teal)';return}
+  var s2=Math.ceil(rem/1000);
+  el.textContent=('0'+Math.floor(s2/60)).slice(-2)+':'+('0'+s2%60).slice(-2);
+  el.style.color=s2<=120?'var(--teal)':'var(--yellow)';
+},1000);
 var lastStateAt=0;
 var es=new EventSource('/api/stream');
 es.onmessage=function(ev){var d=JSON.parse(ev.data);
   if(d.kind==='hello'&&d.journal)d.journal.slice().reverse().forEach(addLog);
   else if(d.kind==='log')addLog(d.e);
-  else if(d.kind==='state'){lastStateAt=Date.now();render(d.s)}};
+  else if(d.kind==='state'){lastStateAt=Date.now();
+    if(d.s.relance){relIn=d.s.relance.inMs;relFlat=d.s.relance.flat;relPend=d.s.relance.pending;relOn=d.s.relance.on;relSync=Date.now()}
+    render(d.s)}};
 setInterval(function(){
   if(Date.now()-lastStateAt<6000)return;
   fetch('/api/snapshot').then(function(r){return r.json()}).then(function(d){
     if(d.journal)d.journal.forEach(addLog);
-    if(d.s){lastStateAt=Date.now();render(d.s)}
+    if(d.s){lastStateAt=Date.now();
+      if(d.s.relance){relIn=d.s.relance.inMs;relFlat=d.s.relance.flat;relPend=d.s.relance.pending;relOn=d.s.relance.on;relSync=Date.now()}
+      render(d.s)}
   }).catch(function(){})
 },4000);
 </script></body></html>`;
@@ -1372,7 +1458,7 @@ app.get('/', (req, res) => {
   res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(DASH_HTML);
 });
-app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v6.7-fix', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
+app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v7.0-close', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
 
 // ═════════════ DEMARRAGE MOTEUR ═════════════
 async function startEngine() {
