@@ -232,7 +232,7 @@ app.post('/api/pnl-reel', async (req, res) => {
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v6.5-stakes', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v6.6-ui', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -429,7 +429,7 @@ const PX_DEC  = SYMBOL === 'BTCUSDT' ? 1 : 2;      // precision prix
 // ── ETAT MOTEUR ──
 const S = {
   running: false, killed: false,
-  price: 0, priceChg24h: 0,
+  price: 0, priceChg24h: 0, chg24: null, pnlLow: 0,
   candles1m: [],               // clotures 1m {t,h,l,c} (max 240)
   candles5m: [], cur5: null,   // bougies 5m {h,l,c} pour ADX
   lastClosed1m: 0,             // openTime de la derniere 1m traitee
@@ -973,6 +973,12 @@ async function pollLoop() {
     }
     S.ticks++;
     const now = Date.now();
+    if (!pollLoop._t24 || now - pollLoop._t24 > 60000) {
+      pollLoop._t24 = now;
+      fetch(`${KLINE_BASE}/fapi/v1/ticker/24hr?symbol=${SYMBOL}`, { signal: AbortSignal.timeout(5000) })
+        .then(r => r.json()).then(j => { const v = parseFloat(j.priceChangePercent); if (isFinite(v)) S.chg24 = v; })
+        .catch(() => {});
+    }
     if (now - S.lastHb >= 60000) {
       S.lastHb = now;
       jlog('sys', `💓 ${S.ticks} polls/min · ${SYMBOL} ${S.price.toFixed(PX_DEC)} · regime ${S.regime}${S.adx ? ' ADX ' + S.adx.toFixed(0) : ''} · ${S.trades.length} pos · ${ENGINE_MODE.toUpperCase()}`);
@@ -1000,16 +1006,26 @@ function sseState(force) {
     if (!viaStats[t.via]) viaStats[t.via] = { n: 0, w: 0, pnl: 0 };
     viaStats[t.via].n++; if (t.pnl > 0) viaStats[t.via].w++; viaStats[t.via].pnl += t.pnl;
   }
+  const pnlOpen = S.trades.reduce((a, t) => a + (t.pnl || 0), 0);
+  const pnlClosed = S.closed.reduce((a, t) => a + t.pnl, 0);
+  const pnlTot = pnlClosed + pnlOpen;
+  if (pnlTot < S.pnlLow) S.pnlLow = pnlTot;
   sseBroadcast({ kind: 'state', s: {
     mode: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, killed: S.killed,
-    price: S.price, regime: S.regime, adx: S.adx, pdi: S.pdi, ndi: S.ndi,
+    armed: !!(E_KEY && E_SECRET),
+    price: S.price, chg24: S.chg24, regime: S.regime, adx: S.adx, pdi: S.pdi, ndi: S.ndi,
     sigQ: S.sigQ, sigDir: S.sigDir,
+    closes: S.candles1m.slice(-170).map(c => c.c),
+    pnlOpen, pnlClosed, ddPct: S.pnlLow < 0 ? (-S.pnlLow / P.CAP * 100) : 0,
+    Pp: { cap: P.CAP, s1: P.STAKE, s2: P.STAKE_MID, s3: P.STAKE_MAX, fs: FORCE_STAKE,
+          sl: P.SL, tp: P.TP, tr: P.TRAIL, tpr: P.TP_RANGE, kill: P.CAP * P.KILL },
     cap: P.CAP, paperCap: S.paperCap, wallet: S.walletNow, sessionPnl: S.sessionPnl, unreal: S.unreal,
     netReel: S.netReel,
     open: S.trades.map(t => ({ dir: t.dir, via: t.via, mode: t.mode, lev: t.lev, entry: t.entry, qty: t.qty, stake: t.stake, pnl: t.pnl, tpLocked: t.tpLocked, sl: t.sl, tp: t.tp })),
     closedN: S.closed.length, wins, wr: S.closed.length ? Math.round(100 * wins / S.closed.length) : null,
     viaStats,
-    lastClosed: S.closed.slice(-8).reverse().map(t => ({ dir: t.dir, via: t.via, pnl: t.pnl, reason: t.reason })),
+    lastClosed: S.closed.slice(-15).reverse().map(t => ({ dir: t.dir, via: t.via, lev: t.lev, entry: t.entry,
+      exit: t.exit, stake: t.stake, pnl: t.pnl, reason: t.reason, dur: (t.closeTime || 0) - (t.openTime || 0) })),
     lastDiag: S.diag.length ? S.diag[S.diag.length - 1] : null,
     funnelTop: Object.entries(S.funnel).sort((a, b) => b[1] - a[1]).slice(0, 3)
   }});
@@ -1077,110 +1093,269 @@ app.get('/api/state', (req, res) => { sseState(true); res.status(200).json({ ok:
 // ═════════════ DASHBOARD INTEGRE (spectateur pur — AUCUNE cle, AUCUNE logique) ═════════════
 const DASH_HTML = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Itachi v6.5 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
+<title>Itachi v6.6 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
 <style>
-:root{--bg:#0a0e14;--surface:#111722;--border:#1d2635;--text:#e6edf3;--muted:#7d8ba1;--teal:#00f5c8;--red:#ff3056;--yellow:#ffc94d}
-*{box-sizing:border-box;margin:0;padding:0}body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',ui-monospace,monospace;font-size:13px;padding:14px}
-.top{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}
-.logo{font-weight:700;font-size:16px}.logo b{color:var(--teal)}
-.badge{padding:3px 10px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:1px;border:1px solid var(--border)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:12px}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px}
-.lbl{font-size:9px;color:var(--muted);letter-spacing:1.5px;margin-bottom:4px}.val{font-size:16px;font-weight:700}
-.teal{color:var(--teal)}.red{color:var(--red)}.yel{color:var(--yellow)}.mut{color:var(--muted)}
-table{width:100%;border-collapse:collapse;font-size:11px}th{color:var(--muted);font-size:9px;letter-spacing:1px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border)}
-td{padding:6px 8px;border-bottom:1px solid var(--border)}
-#journal{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px;height:260px;overflow-y:auto;font-size:11px;line-height:1.8}
-h3{font-size:10px;color:var(--muted);letter-spacing:2px;margin:14px 0 6px}
-.jl-sys{color:var(--muted)}.jl-buy{color:var(--teal)}.jl-sell{color:var(--red)}.jl-info{color:var(--yellow)}
+:root{--bg:#05070d;--panel:#0a0e17;--surface:#0e1420;--border:#1a2333;--text:#e6edf3;--muted:#7d8ba1;--muted2:#4a5568;--teal:#37e0b0;--blue:#7b87ff;--gold:#d9a441;--red:#ff3b5c;--yellow:#ffc94d}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',ui-monospace,Consolas,monospace;font-size:13px}
+.topbar{display:flex;align-items:center;gap:14px;padding:12px 18px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.logo{font-weight:700;font-size:17px;display:flex;align-items:center;gap:8px}
+.logo b{color:var(--teal)}
+.pulse{width:8px;height:8px;border-radius:50%;background:var(--teal);box-shadow:0 0 10px var(--teal);animation:pu 2s infinite}
+@keyframes pu{50%{opacity:.35}}
+.sub{color:var(--muted);font-weight:400;font-size:11px}
+.tright{margin-left:auto;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.badge{padding:3px 12px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:1.5px;border:1px solid var(--border)}
+.src{color:var(--muted);font-size:11px}.src i{color:var(--teal);font-style:normal}
+#clock{color:var(--muted);font-size:12px}
+.app{display:grid;grid-template-columns:330px 1fr;min-height:calc(100vh - 54px)}
+.side{border-right:1px solid var(--border);padding:16px;background:var(--panel);overflow-y:auto}
+.main{padding:0;display:flex;flex-direction:column;min-width:0}
+h4{font-size:10px;color:var(--muted);letter-spacing:2.5px;margin:18px 0 8px}
+h4:first-child{margin-top:0}
+.row{display:flex;justify-content:space-between;padding:4px 0;font-size:12px}
+.row .l{color:var(--muted)}
+.hr{border-top:1px solid var(--border);margin:10px 0}
+.warn{background:rgba(255,59,92,.08);border:1px solid rgba(255,59,92,.35);border-radius:8px;padding:8px 10px;font-size:11px;color:var(--red);margin:8px 0}
+input{width:100%;background:#070b12;border:1px solid var(--border);border-radius:8px;color:var(--text);padding:9px 10px;font-family:inherit;font-size:12px;margin:5px 0}
+input::placeholder{color:var(--muted2)}
+.btn{width:100%;border:0;border-radius:8px;padding:11px;font-weight:700;font-family:inherit;font-size:13px;cursor:pointer;margin-top:8px;letter-spacing:.5px}
+.btn.go{background:var(--teal);color:#03211a}
+.btn.stop{background:transparent;color:var(--red);border:1px solid var(--red)}
+#kMsg{font-size:11px;color:var(--muted);margin-top:8px;line-height:1.5}
+.netbox{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin-top:10px;font-size:12px;line-height:1.9}
+.chartwrap{position:relative;height:400px;border-bottom:1px solid var(--border);background:radial-gradient(ellipse at 50% 0%,rgba(55,224,176,.05),transparent 65%)}
+canvas{width:100%;height:100%;display:block}
+.phead{display:flex;align-items:baseline;gap:12px;padding:14px 18px 4px}
+.pair{color:var(--muted);font-size:12px;letter-spacing:1px}
+#bigpx{font-size:32px;font-weight:700;color:var(--teal)}
+#bigpct{font-weight:700;font-size:14px}
+.sigrow{display:flex;align-items:center;gap:14px;padding:12px 18px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.siglbl{color:var(--muted);letter-spacing:2px;font-size:11px}
+.gauge{width:200px;height:6px;background:var(--surface);border-radius:4px;overflow:hidden}
+#gfill{height:100%;width:0%;border-radius:4px;transition:width .5s,background .5s}
+#qval{font-weight:700;font-size:16px;min-width:34px}
+.pill{padding:5px 16px;border-radius:8px;font-weight:700;font-size:12px;letter-spacing:1px;border:1px solid var(--border)}
+#regTxt{font-weight:700;font-size:12px;letter-spacing:.5px}
+#levNext{color:var(--muted);font-size:12px}
+#levNext b{font-size:13px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));border-bottom:1px solid var(--border)}
+.st{padding:12px 10px;border-right:1px solid var(--border)}
+.st .l{font-size:9px;color:var(--muted);letter-spacing:1.5px;margin-bottom:5px;display:flex;gap:4px;align-items:center}
+.st .v{font-size:17px;font-weight:700}
+section{padding:14px 18px}
+.sechead{font-size:11px;color:var(--muted);letter-spacing:2.5px;margin-bottom:8px;display:flex;justify-content:space-between}
+table{width:100%;border-collapse:collapse;font-size:11px}
+th{color:var(--muted);font-size:9px;letter-spacing:1.2px;text-align:left;padding:7px 8px;border-bottom:1px solid var(--border);font-weight:600}
+td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
+.mut{color:var(--muted)}.teal{color:var(--teal)}.red{color:var(--red)}.yel{color:var(--yellow)}.blue{color:var(--blue)}.gold{color:var(--gold)}
+#journal{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 12px;height:230px;overflow-y:auto;font-size:11.5px;line-height:1.9}
+#journal div{white-space:pre-wrap}
+.jl-sys{color:#8ea8ff}.jl-buy{color:var(--teal)}.jl-sell{color:var(--red)}.jl-info{color:var(--yellow)}
+.ts{color:var(--muted2);margin-right:8px}
+@media(max-width:900px){.app{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--border)}}
 </style></head><body>
-<div class="top">
-  <span class="logo">CryptoSignal<b>AI</b> <span class="mut" style="font-weight:400;font-size:11px">/ Itachi v6.5 SERVER · Srv 4.0 · WR: à mesurer · mises 120/160/280</span></span>
-  <span class="badge" id="bMode">—</span><span class="badge" id="bRegime">—</span><span class="badge" id="bRun">—</span>
+<div class="topbar">
+  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v6.6 SERVER · Srv 4.0 · WR: à mesurer</span></span>
+  <span class="tright">
+    <span class="src"><i>●</i> Prix Binance live</span>
+    <span class="badge" id="bMode">—</span>
+    <span class="badge" id="bRun">—</span>
+    <span id="clock"></span>
+  </span>
 </div>
-<div class="card" style="margin-bottom:12px">
-  <div class="lbl">🔐 ARMEMENT LIVE — clés envoyées UNE fois au moteur (RAM), jamais stockées · pour ARRÊTER : colle les 8+ premiers caractères de ta clé puis ⏹</div>
-  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
-    <input id="kKey" type="password" placeholder="API KEY" autocomplete="off" style="flex:1;min-width:170px;background:#0a0e14;border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px;font-family:inherit">
-    <input id="kSec" type="password" placeholder="API SECRET" autocomplete="off" style="flex:1;min-width:170px;background:#0a0e14;border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px;font-family:inherit">
-    <button id="bStart" style="background:var(--teal);color:#000;border:0;border-radius:6px;padding:8px 14px;font-weight:700;cursor:pointer;font-family:inherit">▶ ARMER LIVE</button>
-    <button id="bStop" style="background:transparent;color:var(--red);border:1px solid var(--red);border-radius:6px;padding:8px 14px;font-weight:700;cursor:pointer;font-family:inherit">⏹ ARRÊTER</button>
+<div class="app">
+<div class="side">
+  <h4>PARAMÈTRES BOT</h4>
+  <div class="row"><span class="l">Capital référence</span><b class="teal" id="pCap">—</b></div>
+  <div class="row"><span class="l">Mise standard</span><b id="pS1">—</b></div>
+  <div class="row"><span class="l">Mise Q≥50</span><b class="yel" id="pS2">—</b></div>
+  <div class="row"><span class="l">Mise max Q≥70</span><b class="yel" id="pS3">—</b></div>
+  <div class="row"><span class="l">⚡ Relance 30min</span><b id="pFS">—</b></div>
+  <div class="row"><span class="l">Max positions / sens</span><b>2 (esp. 0.3%)</b></div>
+  <div class="hr"></div>
+  <div class="row"><span class="l">Levier Q &lt; 45</span><b class="teal">3×</b></div>
+  <div class="row"><span class="l">Levier Q 45-69</span><b class="yel">7×</b></div>
+  <div class="row"><span class="l">Levier Q ≥ 70</span><b class="red">12×</b></div>
+  <div class="hr"></div>
+  <div class="row"><span class="l">Stop-Loss</span><b class="red" id="pSL">— (Binance)</b></div>
+  <div class="row"><span class="l">Activation trail</span><b class="teal" id="pTP">— (Binance)</b></div>
+  <div class="row"><span class="l">Trailing natif</span><b class="teal" id="pTR">— pic (Binance)</b></div>
+  <div class="row"><span class="l">TP fixe RANGE</span><b class="teal" id="pTPR">—</b></div>
+  <div class="row"><span class="l">Kill switch</span><b class="red" id="pKill">—</b></div>
+  <h4>🔗 BINANCE — CONNEXION</h4>
+  <div class="warn">⚠ ARGENT RÉEL · Ton compte Binance<br>fapi.binance.com — clés en RAM, jamais stockées</div>
+  <div class="l" style="font-size:10px;color:var(--muted);letter-spacing:1px;margin-top:6px">API KEY</div>
+  <input id="kKey" type="password" placeholder="Colle ta clé API" autocomplete="off">
+  <div class="l" style="font-size:10px;color:var(--muted);letter-spacing:1px">API SECRET</div>
+  <input id="kSec" type="password" placeholder="Colle ton secret API" autocomplete="off">
+  <button class="btn go" id="bStart">🔐 Connecter + ▶ ARMER LIVE</button>
+  <button class="btn stop" id="bStop">⏹ Arrêter (vérif : 8+ car. de la clé)</button>
+  <div id="kMsg">Moteur non armé — colle tes clés puis ▶ (à refaire après chaque redéploiement Railway)</div>
+  <div class="netbox">💰 <b>NET RÉEL Binance (session)</b><br>
+    Net: <b id="nNet" class="teal">—</b> · brut <span id="nBrut">—</span><br>
+    frais <span id="nFrais">—</span> · funding <span id="nFund">—</span></div>
+</div>
+<div class="main">
+  <div class="phead"><span class="pair">BTC/USDT · Binance réel</span><span id="bigpx">$—</span><span id="bigpct" class="teal">—</span></div>
+  <div class="chartwrap"><canvas id="chart"></canvas></div>
+  <div class="sigrow">
+    <span class="siglbl">FORCE SIGNAL</span>
+    <span class="gauge"><span id="gfill" style="display:block"></span></span>
+    <span id="qval">—</span>
+    <span class="pill" id="dirPill">— NEUTRE</span>
+    <span id="regTxt">—</span>
+    <span id="levNext">Levier prochain : <b>—</b></span>
   </div>
-  <div id="kMsg" class="mut" style="margin-top:6px;font-size:11px">Moteur non armé : colle tes clés puis ▶ (après un redémarrage Railway, ré-armer ici)</div>
+  <div class="stats">
+    <div class="st"><div class="l">CAPITAL</div><div class="v teal" id="sCap">—</div></div>
+    <div class="st"><div class="l">P&L TOTAL</div><div class="v" id="sTot">—</div></div>
+    <div class="st"><div class="l">P&L OPEN</div><div class="v" id="sOpen">—</div></div>
+    <div class="st"><div class="l">📂 OUVERTS</div><div class="v yel" id="sN">0</div></div>
+    <div class="st"><div class="l">📁 FERMÉS</div><div class="v" id="sF">0</div></div>
+    <div class="st"><div class="l">✅ GAGNÉS</div><div class="v teal" id="sW">0</div></div>
+    <div class="st"><div class="l">🔴 PERDUS</div><div class="v red" id="sL">0</div></div>
+    <div class="st"><div class="l">WIN RATE</div><div class="v teal" id="sWR">—</div></div>
+    <div class="st"><div class="l">DRAWDOWN MAX</div><div class="v red" id="sDD">0.00%</div></div>
+    <div class="st"><div class="l">PRIX RÉEL</div><div class="v teal" id="sPx">—</div></div>
+  </div>
+  <section>
+    <div class="sechead"><span>POSITIONS</span><span id="posN" class="mut">0 actives</span></div>
+    <table><thead><tr><th>SENS</th><th>VIA</th><th>MODE</th><th>LEV</th><th>ENTRÉE</th><th>QTY</th><th>SL</th><th>SORTIE</th><th>P&L</th></tr></thead>
+    <tbody id="tOpen"><tr><td colspan="9" class="mut">Aucune position</td></tr></tbody></table>
+  </section>
+  <section>
+    <div class="sechead"><span>WIN RATE PAR VOIE (via=)</span></div>
+    <table><thead><tr><th>VOIE</th><th>TRADES</th><th>WR</th><th>P&L NET</th></tr></thead>
+    <tbody id="tVia"><tr><td colspan="4" class="mut">En attente des premiers trades</td></tr></tbody></table>
+  </section>
+  <section>
+    <div class="sechead"><span>JOURNAL BOT</span><span id="jN" class="mut">0 événements</span></div>
+    <div id="journal"></div>
+  </section>
+  <section>
+    <div class="sechead"><span>HISTORIQUE — TRADES FERMÉS</span></div>
+    <table><thead><tr><th>#</th><th>SENS</th><th>LEVIER</th><th>ENTRÉE</th><th>SORTIE</th><th>INVESTI</th><th>GAIN / PERTE</th><th>RENDEMENT</th><th>RAISON</th><th>DURÉE</th></tr></thead>
+    <tbody id="tHist"><tr><td colspan="10" class="mut">Aucun trade fermé pour l'instant</td></tr></tbody></table>
+  </section>
 </div>
-<div class="grid">
-  <div class="card"><div class="lbl">PRIX</div><div class="val teal" id="vPrice">—</div></div>
-  <div class="card"><div class="lbl">SIGNAL Q</div><div class="val" id="vQ">—</div></div>
-  <div class="card"><div class="lbl">P&L SESSION (RÉEL)</div><div class="val" id="vPnl">—</div></div>
-  <div class="card"><div class="lbl">NET RÉEL BINANCE</div><div class="val" id="vNet">—</div></div>
-  <div class="card"><div class="lbl">OUVERTES</div><div class="val yel" id="vOpen">0</div></div>
-  <div class="card"><div class="lbl">FERMÉES</div><div class="val" id="vClosed">0</div></div>
-  <div class="card"><div class="lbl">WIN RATE</div><div class="val teal" id="vWR">—</div></div>
-  <div class="card" style="grid-column:span 2"><div class="lbl">DERNIER VERDICT — POURQUOI PAS D'ENTRÉE</div><div class="val yel" style="font-size:11px" id="vWhy">—</div></div>
 </div>
-<h3>POSITIONS OUVERTES</h3>
-<div class="card"><table><thead><tr><th>SENS</th><th>VIA</th><th>MODE</th><th>LEV</th><th>ENTRÉE</th><th>QTY</th><th>SL</th><th>SORTIE</th><th>P&L</th></tr></thead><tbody id="tOpen"><tr><td colspan="9" class="mut">Aucune position</td></tr></tbody></table></div>
-<h3>WIN RATE PAR VOIE (via=)</h3>
-<div class="card"><table><thead><tr><th>VOIE</th><th>TRADES</th><th>WR</th><th>P&L NET</th></tr></thead><tbody id="tVia"><tr><td colspan="4" class="mut">En attente des premiers trades</td></tr></tbody></table></div>
-<h3>JOURNAL BOT</h3>
-<div id="journal"></div>
 <script>
-const $=id=>document.getElementById(id);
+var $=function(id){return document.getElementById(id)};
+var chartCloses=[],lastPrice=0,jCount=0;
+setInterval(function(){var d=new Date();$('clock').textContent=('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2)},1000);
 function fp(x,d){return x==null?'—':Number(x).toLocaleString('fr-FR',{minimumFractionDigits:d,maximumFractionDigits:d})}
-function money(x){if(x==null)return '—';const s=x>=0?'+$':'-$';return s+Math.abs(x).toFixed(2)}
-function addLog(e){const d=new Date(e.ts).toLocaleTimeString('fr-FR');const div=document.createElement('div');div.className='jl-'+e.type;div.textContent=d+'  '+e.msg;const j=$('journal');j.prepend(div);while(j.children.length>200)j.lastChild.remove()}
-function render(s){
-  $('bMode').textContent=s.mode.toUpperCase()+' · '+s.net.toUpperCase();
-  $('bMode').style.color=s.mode==='live'?'var(--red)':s.mode==='paper'?'var(--yellow)':'var(--muted)';
-  const rl={RANGE:'◆ RANGE · MR 2 sens',UP:'▲ UP · longs',DOWN:'▼ DOWN · shorts',WARMUP:'⏳ WARM-UP'};
-  const rc={RANGE:'var(--yellow)',UP:'var(--teal)',DOWN:'var(--red)',WARMUP:'var(--muted)'};
-  $('bRegime').textContent=(rl[s.regime]||s.regime)+(s.adx?' · ADX '+s.adx.toFixed(0):'');
-  $('bRegime').style.color=rc[s.regime]||'var(--muted)';
-  $('bRun').textContent=s.killed?'⛔ KILL':s.running?'● EN MARCHE':'⏸ ARRÊTÉ';
-  $('bRun').style.color=s.killed?'var(--red)':s.running?'var(--teal)':'var(--muted)';
-  $('vPrice').textContent='$'+fp(s.price,1);
-  $('vQ').textContent=s.sigQ+' '+(s.sigDir==='BULL'?'▲':s.sigDir==='BEAR'?'▼':'—');
-  const pnl=s.mode==='paper'?(s.paperCap-s.cap):s.sessionPnl;
-  $('vPnl').textContent=money(pnl);$('vPnl').className='val '+(pnl>=0?'teal':'red');
-  $('vNet').textContent=s.netReel?money(s.netReel.net):'—';
-  if(s.netReel)$('vNet').className='val '+(s.netReel.net>=0?'teal':'red');
-  $('vOpen').textContent=s.open.length;$('vClosed').textContent=s.closedN;
-  if(s.lastDiag)$('vWhy').textContent=s.lastDiag.verdict+(s.lastDiag.rsi!=null?' · RSI '+s.lastDiag.rsi:'')+(s.funnelTop&&s.funnelTop.length?'  |  cumul: '+s.funnelTop.map(x=>x[0]+'×'+x[1]).join(' · '):'');
-  $('vWR').textContent=s.wr==null?'—':s.wr+'%';
-  $('tOpen').innerHTML=s.open.length?s.open.map(t=>'<tr><td class="'+(t.dir==='LONG'?'teal':'red')+'">'+t.dir+'</td><td>'+t.via+'</td><td>'+(t.mode==='RANGE'?'◆ MR':t.tpLocked?'🟢 TRAIL':'⏳')+'</td><td>x'+t.lev+'</td><td>'+fp(t.entry,1)+'</td><td>'+t.qty+'</td><td>'+fp(t.sl,1)+'</td><td>'+fp(t.tp,1)+'</td><td class="'+(t.pnl>=0?'teal':'red')+'">'+money(t.pnl)+'</td></tr>').join(''):'<tr><td colspan="9" class="mut">Aucune position</td></tr>';
-  const vs=Object.entries(s.viaStats||{});
-  $('tVia').innerHTML=vs.length?vs.map(([v,x])=>'<tr><td>'+v+'</td><td>'+x.n+'</td><td>'+Math.round(100*x.w/x.n)+'%</td><td class="'+(x.pnl>=0?'teal':'red')+'">'+money(x.pnl)+'</td></tr>').join(''):'<tr><td colspan="4" class="mut">En attente des premiers trades</td></tr>';
+function money(x){if(x==null)return '—';return (x>=0?'+$':'-$')+Math.abs(x).toFixed(2)}
+function dur(ms){var s=Math.round(ms/1000);return Math.floor(s/60)+'m'+('0'+s%60).slice(-2)+'s'}
+function emaS(a,p){var k=2/(p+1),e=a[0];return a.map(function(v,i){e=i?v*k+e*(1-k):v;return e})}
+function drawChart(){
+  var cv=$('chart'),ctx=cv.getContext('2d');
+  var W=cv.width=cv.clientWidth*2,H=cv.height=cv.clientHeight*2;
+  ctx.clearRect(0,0,W,H);
+  var data=chartCloses.slice();if(lastPrice)data.push(lastPrice);
+  if(data.length<10)return;
+  var view=data.slice(-160);
+  var lo=Math.min.apply(null,view),hi=Math.max.apply(null,view),pad=(hi-lo)*0.18||1;
+  function Y(v){return H-((v-(lo-pad))/((hi+pad)-(lo-pad)))*H}
+  function X(i){return 14+i/(view.length-1)*(W-170)}
+  ctx.font='19px JetBrains Mono,monospace';
+  for(var g=1;g<5;g++){var vy=lo-pad+((hi+pad)-(lo-pad))*g/5,yy=Y(vy);
+    ctx.strokeStyle='rgba(125,139,161,.10)';ctx.beginPath();ctx.moveTo(0,yy);ctx.lineTo(W,yy);ctx.stroke();
+    ctx.fillStyle='#5a6a82';ctx.fillText(fp(vy,2),10,yy-6)}
+  var e8=emaS(view,8),e21=emaS(view,21);
+  function line(arr,color,w,glow){ctx.beginPath();for(var i=0;i<arr.length;i++){var px=X(i),py=Y(arr[i]);i?ctx.lineTo(px,py):ctx.moveTo(px,py)}
+    ctx.strokeStyle=color;ctx.lineWidth=w;ctx.shadowBlur=glow?14:0;ctx.shadowColor=color;ctx.stroke();ctx.shadowBlur=0}
+  line(e21,'#d9a441',2.5,false);line(e8,'#7b87ff',2.5,false);line(view,'#37e0b0',3,true);
+  var cp=view[view.length-1],cy=Y(cp);
+  ctx.setLineDash([7,7]);ctx.strokeStyle='rgba(55,224,176,.45)';ctx.beginPath();ctx.moveTo(0,cy);ctx.lineTo(W,cy);ctx.stroke();ctx.setLineDash([]);
+  ctx.fillStyle='#37e0b0';ctx.fillRect(W-148,cy-19,142,38);
+  ctx.fillStyle='#03211a';ctx.font='bold 22px JetBrains Mono,monospace';ctx.fillText(fp(cp,1),W-140,cy+8);
+  ctx.font='20px JetBrains Mono,monospace';
+  ctx.fillStyle='#7b87ff';ctx.fillText('— EMA 8',16,30);
+  ctx.fillStyle='#d9a441';ctx.fillText('— EMA 21',140,30);
 }
-$('bStart').onclick=async()=>{
-  const k=$('kKey').value.trim(),s2=$('kSec').value.trim();
+window.addEventListener('resize',drawChart);
+function addLog(e){jCount++;$('jN').textContent=jCount+' événements';
+  var d=new Date(e.ts),t=('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2);
+  var div=document.createElement('div');div.className='jl-'+e.type;
+  div.innerHTML='<span class="ts">'+t+'</span>'+e.msg.replace(/</g,'&lt;');
+  var j=$('journal');j.prepend(div);while(j.children.length>250)j.lastChild.remove()}
+function render(s){
+  $('bMode').textContent=(s.mode==='live'?'🔴 LIVE · ':s.mode==='paper'?'📝 PAPER · ':'OFF · ')+s.net.toUpperCase();
+  $('bMode').style.color=s.mode==='live'?'var(--red)':s.mode==='paper'?'var(--yellow)':'var(--muted)';
+  $('bRun').textContent=s.killed?'⛔ KILL SWITCH':s.running?'● EN MARCHE':'⏸ ARRÊTÉ';
+  $('bRun').style.color=s.killed?'var(--red)':s.running?'var(--teal)':'var(--muted)';
+  if(s.Pp){$('pCap').textContent='$'+fp(s.Pp.cap,0);$('pS1').textContent='$'+s.Pp.s1;$('pS2').textContent='$'+s.Pp.s2;$('pS3').textContent='$'+s.Pp.s3;$('pFS').textContent='$'+s.Pp.fs+' ×12';
+    $('pSL').textContent='-'+(s.Pp.sl*100).toFixed(1)+'% (Binance)';$('pTP').textContent='+'+(s.Pp.tp*100).toFixed(1)+'% (Binance)';
+    $('pTR').textContent='-'+(s.Pp.tr*100).toFixed(1)+'% pic (Binance)';$('pTPR').textContent='+'+(s.Pp.tpr*100).toFixed(1)+'%';
+    $('pKill').textContent='-$'+fp(s.Pp.kill,0)+' réel'}
+  lastPrice=s.price||0;if(s.closes)chartCloses=s.closes;
+  $('bigpx').textContent='$'+fp(s.price,2);$('sPx').textContent='$'+fp(s.price,2);
+  if(s.chg24!=null){$('bigpct').textContent=(s.chg24>=0?'+':'')+s.chg24.toFixed(2)+'%';$('bigpct').className=s.chg24>=0?'teal':'red'}
+  var q=s.sigQ||0;$('qval').textContent=q;
+  $('qval').style.color=q>=70?'var(--teal)':q>=45?'var(--yellow)':'var(--red)';
+  $('gfill').style.width=q+'%';$('gfill').style.background=q>=70?'var(--teal)':q>=45?'var(--yellow)':'var(--red)';
+  var dp=$('dirPill');
+  if(s.sigDir==='BULL'){dp.textContent='▲ HAUSSIER';dp.style.color='var(--teal)';dp.style.borderColor='var(--teal)'}
+  else if(s.sigDir==='BEAR'){dp.textContent='▼ BAISSIER';dp.style.color='var(--red)';dp.style.borderColor='var(--red)'}
+  else{dp.textContent='— NEUTRE';dp.style.color='var(--muted)';dp.style.borderColor='var(--border)'}
+  var rl={RANGE:'◆ RANGE · MR 2 sens',UP:'▲ UP · longs',DOWN:'▼ DOWN · shorts',WARMUP:'⏳ WARM-UP'};
+  var rc={RANGE:'var(--yellow)',UP:'var(--teal)',DOWN:'var(--red)',WARMUP:'var(--muted)'};
+  $('regTxt').textContent=(rl[s.regime]||s.regime)+(s.adx?' · ADX '+s.adx.toFixed(0):'');
+  $('regTxt').style.color=rc[s.regime]||'var(--muted)';
+  var lev=q<45?3:q<70?7:12;
+  $('levNext').innerHTML='Levier prochain : <b style="color:'+(lev===3?'var(--teal)':lev===7?'var(--yellow)':'var(--red)')+'">'+lev+'×</b>';
+  $('sCap').textContent='$'+fp(s.Pp?s.Pp.cap:0,2);
+  $('sTot').textContent=money(s.pnlClosed);$('sTot').className='v '+((s.pnlClosed||0)>=0?'teal':'red');
+  $('sOpen').textContent=money(s.pnlOpen);$('sOpen').className='v '+((s.pnlOpen||0)>=0?'teal':'red');
+  $('sN').textContent=s.open.length;$('sF').textContent=s.closedN;$('sW').textContent=s.wins;$('sL').textContent=s.closedN-s.wins;
+  $('sWR').textContent=s.wr==null?'—':s.wr+'%';
+  $('sDD').textContent=(s.ddPct||0).toFixed(2)+'%';
+  $('posN').textContent=s.open.length+' actives';
+  $('tOpen').innerHTML=s.open.length?s.open.map(function(t){
+    return '<tr><td class="'+(t.dir==='LONG'?'teal':'red')+'"><b>'+t.dir+'</b></td><td class="mut">'+t.via+'</td><td>'+(t.mode==='RANGE'?'◆ MR':t.mode==='FORCE'?'⚡':t.tpLocked?'🟢 TRAIL':'⏳')+'</td><td>×'+t.lev+'</td><td>'+fp(t.entry,1)+'</td><td>'+t.qty+'</td><td class="red">'+fp(t.sl,1)+'</td><td class="teal">'+fp(t.tp,1)+'</td><td class="'+(t.pnl>=0?'teal':'red')+'"><b>'+money(t.pnl)+'</b></td></tr>'
+  }).join(''):'<tr><td colspan="9" class="mut">Aucune position</td></tr>';
+  var vs=Object.keys(s.viaStats||{});
+  $('tVia').innerHTML=vs.length?vs.map(function(v){var x=s.viaStats[v];
+    return '<tr><td>'+v+'</td><td>'+x.n+'</td><td>'+Math.round(100*x.w/x.n)+'%</td><td class="'+(x.pnl>=0?'teal':'red')+'">'+money(x.pnl)+'</td></tr>'
+  }).join(''):'<tr><td colspan="4" class="mut">En attente des premiers trades</td></tr>';
+  $('tHist').innerHTML=(s.lastClosed&&s.lastClosed.length)?s.lastClosed.map(function(t,i){
+    var rdt=t.stake?(100*t.pnl/t.stake):0;
+    return '<tr><td class="mut">'+(s.closedN-i)+'</td><td class="'+(t.dir==='LONG'?'teal':'red')+'">'+t.dir+'</td><td>×'+t.lev+'</td><td>'+fp(t.entry,1)+'</td><td>'+fp(t.exit,1)+'</td><td>$'+fp(t.stake,0)+'</td><td class="'+(t.pnl>=0?'teal':'red')+'"><b>'+money(t.pnl)+'</b></td><td class="'+(rdt>=0?'teal':'red')+'">'+(rdt>=0?'+':'')+rdt.toFixed(1)+'%</td><td class="mut">'+(t.reason||'')+'</td><td class="mut">'+dur(t.dur||0)+'</td></tr>'
+  }).join(''):'<tr><td colspan="10" class="mut">Aucun trade fermé pour l\'instant</td></tr>';
+  if(s.armed&&s.running)$('kMsg').textContent='✅ Moteur ARMÉ et en marche — tu peux fermer cette page, le bot continue.';
+  drawChart();
+}
+$('bStart').onclick=function(){
+  var k=$('kKey').value.trim(),s2=$('kSec').value.trim();
   if(!k||!s2){$('kMsg').textContent='Clés manquantes';return}
   $('kMsg').textContent='Armement en cours...';
-  try{const r=await fetch('/api/engine/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,secret:s2})});
-    const d=await r.json();
+  fetch('/api/engine/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,secret:s2})})
+  .then(function(r){return r.json()}).then(function(d){
     $('kMsg').textContent=d.ok?'✅ MOTEUR LIVE ARMÉ — tu peux fermer cette page, le bot continue.':'⚠ '+(d.error||'échec — voir journal');
-    if(d.ok){$('kKey').value='';$('kSec').value='';}
-  }catch(e){$('kMsg').textContent='⚠ '+e.message}
+    if(d.ok){$('kKey').value='';$('kSec').value=''}
+  }).catch(function(e){$('kMsg').textContent='⚠ '+e.message})
 };
-$('bStop').onclick=async()=>{
-  const k=$('kKey').value.trim();
-  if(k.length<8){$('kMsg').textContent='Vérification : colle les 8+ premiers caractères de ta clé dans le champ API KEY, puis ⏹';return}
-  try{const r=await fetch('/api/engine/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyPrefix:k.slice(0,16)})});
-    const d=await r.json();
-    $('kMsg').textContent=d.ok?'⏹ Moteur arrêté — les SL/TP natifs restent vivants chez Binance.':'⚠ '+(d.error||'refus');
-  }catch(e){$('kMsg').textContent='⚠ '+e.message}
+$('bStop').onclick=function(){
+  var k=$('kKey').value.trim();
+  if(k.length<8){$('kMsg').textContent='Vérification : colle les 8+ premiers caractères de ta clé dans API KEY, puis ⏹';return}
+  fetch('/api/engine/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyPrefix:k.slice(0,16)})})
+  .then(function(r){return r.json()}).then(function(d){
+    $('kMsg').textContent=d.ok?'⏹ Moteur arrêté — les SL/TP natifs restent vivants chez Binance.':'⚠ '+(d.error||'refus')
+  }).catch(function(e){$('kMsg').textContent='⚠ '+e.message})
 };
-const es=new EventSource('/api/stream');
-es.onmessage=ev=>{const d=JSON.parse(ev.data);
+var es=new EventSource('/api/stream');
+es.onmessage=function(ev){var d=JSON.parse(ev.data);
   if(d.kind==='hello'&&d.journal)d.journal.slice().reverse().forEach(addLog);
   else if(d.kind==='log')addLog(d.e);
-  else if(d.kind==='state')render(d.s);};
+  else if(d.kind==='state')render(d.s)};
 </script></body></html>`;
 
 app.get('/', (req, res) => {
   res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(DASH_HTML);
 });
-app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v6.5-stakes', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
+app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v6.6-ui', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
 
 // ═════════════ DEMARRAGE MOTEUR ═════════════
 async function startEngine() {
