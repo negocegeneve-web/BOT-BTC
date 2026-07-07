@@ -232,7 +232,7 @@ app.post('/api/pnl-reel', async (req, res) => {
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v7.2-cap2000', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v7.5-nolock', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -430,6 +430,7 @@ const PX_DEC  = SYMBOL === 'BTCUSDT' ? 1 : 2;      // precision prix
 const S = {
   running: false, killed: false,
   price: 0, priceChg24h: 0, chg24: null, pnlLow: 0, forceReq: 0, paused: false,
+  avail: 0, lastAdoptSig: '', lastAdoptAt: 0, pnlHigh: 0, lastMult: 1,
   candles1m: [],               // clotures 1m {t,h,l,c} (max 240)
   candles5m: [], cur5: null,   // bougies 5m {h,l,c} pour ADX
   lastClosed1m: 0,             // openTime de la derniere 1m traitee
@@ -550,6 +551,12 @@ function calcQMR(dir, close, bb, rsi) {
 
 function getLev(q)   { return q < 45 ? P.LEV_LOW : q < 70 ? P.LEV_MED : P.LEV_HIGH; }
 function getStake(q) { return q >= 70 ? P.STAKE_MAX : q >= 50 ? P.STAKE_MID : P.STAKE; }
+
+// ── DECRET 07/07 : MISES DYNAMIQUES (anti-martingale) ──
+// +5% de mise par palier de +100$ de P&L session, -5% par palier de -100$. Bornes [0.30 ; 2.00].
+function sizeMultFor(pnl) { return Math.min(2, Math.max(0.3, 1 + 0.05 * Math.trunc(pnl / 100))); }
+function sessionPnlNow() { return ENGINE_MODE === 'paper' ? (S.paperCap - P.CAP) : S.sessionPnl; }
+function sizeMult() { return sizeMultFor(sessionPnlNow()); }
 
 // ═════════════ REGIME (agregation 5m + classification) ═════════════
 function aggregate5m(k) {
@@ -745,7 +752,8 @@ async function ensureLeverage(lev) {
 }
 
 async function openPosition(dir, price, lev, q, via, mode) {
-  const stake = mode === 'FORCE' ? FORCE_STAKE : getStake(q);   // RELANCE : 140$ fixe (decret)
+  const mult = sizeMult();
+  const stake = Math.round((mode === 'FORCE' ? FORCE_STAKE : getStake(q)) * mult * 100) / 100;   // mises dynamiques (decret 07/07)
   const qty = Math.floor((stake * lev / price) * Math.pow(10, QTY_DEC)) / Math.pow(10, QTY_DEC);
   if (qty <= 0) { jlog('sell', '⚠ Quantite nulle — entree annulee'); return; }
   const SL_PCT = mode === 'FORCE' ? FORCE_SL : P.SL;
@@ -906,6 +914,16 @@ async function reconcile() {
       const net = parseFloat(row.positionAmt);
       const dir = net > 0 ? 'LONG' : 'SHORT';
       const entry = parseFloat(row.entryPrice || S.price) || S.price;
+      // GARDE ANTI-BOUCLE (bug des 164 fantomes) : jamais 2 adoptions de la meme position en < 120s
+      const sig = dir + ':' + entry.toFixed(1);
+      if (sig === S.lastAdoptSig && Date.now() - S.lastAdoptAt < 120000) {
+        jlog('info', '🤝 Re-adoption ' + sig + ' bloquee (garde 120s) — position laissee aux stops natifs Binance');
+        return;
+      }
+      S.lastAdoptSig = sig; S.lastAdoptAt = Date.now();
+      // PURGE des ordres orphelins des sessions passees AVANT d'en poser un neuf (la source de la boucle)
+      await bnCall(E_BASE, '/fapi/v1/allOpenOrders', 'DELETE', { symbol: SYMBOL }, E_KEY, E_SECRET);
+      jlog('sys', '🧹 Ordres orphelins purges avant adoption (allOpenOrders)');
       const t = { id: Date.now(), dir, entry, lev: Math.max(1, parseInt(row.leverage || '3')), qty: Math.abs(net),
                   stake: P.STAKE, q: 50, via: 'ADOPTE', mode: 'TREND', sl: dir === 'LONG' ? entry * (1 - P.SL) : entry * (1 + P.SL),
                   tp: dir === 'LONG' ? entry * (1 + P.TP) : entry * (1 - P.TP), slPct: P.SL, tpPct: P.TP,
@@ -923,11 +941,14 @@ async function reconcile() {
     if (Array.isArray(bal)) {
       const usdt = bal.find(b => b.asset === 'USDT');
       S.walletNow = usdt ? parseFloat(usdt.balance) : 0;
+      S.avail = usdt ? parseFloat(usdt.availableBalance || usdt.balance) : 0;
       if (S.walletStart > 0 && S.walletNow > 0) {
         S.sessionPnl = (S.walletNow + S.unreal) - S.walletStart;
-        if (!S.killed && S.sessionPnl <= -(P.CAP * P.KILL)) {
+        if (S.sessionPnl > S.pnlHigh) S.pnlHigh = S.sessionPnl;   // plus-haut de session (high-water mark)
+        const killFloor = S.pnlHigh - (P.CAP * P.KILL);            // DECRET 07/07 : kill SUIVEUR = HWM - 400$
+        if (!S.killed && S.sessionPnl <= killFloor) {
           S.killed = true;
-          jlog('sell', `⛔ KILL SWITCH REEL — perte session ${S.sessionPnl.toFixed(2)}$ >= ${(P.CAP*P.KILL).toFixed(0)}$ — FERMETURE TOTALE + ARRET`);
+          jlog('sell', `⛔ KILL SUIVEUR — P&L session ${S.sessionPnl.toFixed(2)}$ <= plancher ${killFloor.toFixed(2)}$ (plus-haut ${S.pnlHigh.toFixed(2)}$ - ${(P.CAP*P.KILL).toFixed(0)}$) — FERMETURE TOTALE + ARRET`);
           for (const t of [...S.trades]) await closePosition(t, S.price, '⛔ KILL REEL', true);
           await bnCall(E_BASE, '/fapi/v1/allOpenOrders', 'DELETE', { symbol: SYMBOL }, E_KEY, E_SECRET); // nettoyage best-effort
           S.running = false;
@@ -1016,14 +1037,20 @@ function sseState(force) {
   const now = Date.now();
   if (!force && now - lastStatePush < 1500) return;   // 1 push max / 1.5s
   lastStatePush = now;
-  const wins = S.closed.filter(t => t.pnl > 0).length;
+  const m9 = sizeMult();
+  if (m9 !== S.lastMult) {
+    jlog('info', `📶 Palier de mise: ×${m9.toFixed(2)} (P&L session ${sessionPnlNow() >= 0 ? '+' : ''}${sessionPnlNow().toFixed(0)}$) — mises ${Math.round(P.STAKE*m9)}/${Math.round(P.STAKE_MID*m9)}/${Math.round(P.STAKE_MAX*m9)}$, forcee ${Math.round(FORCE_STAKE*m9)}$`);
+    S.lastMult = m9;
+  }
+  const realClosed = S.closed.filter(t => t.via !== 'ADOPTE');   // ADOPTE = compta fantome, exclue des stats
+  const wins = realClosed.filter(t => t.pnl > 0).length;
   const viaStats = {};
   for (const t of S.closed) {
     if (!viaStats[t.via]) viaStats[t.via] = { n: 0, w: 0, pnl: 0 };
     viaStats[t.via].n++; if (t.pnl > 0) viaStats[t.via].w++; viaStats[t.via].pnl += t.pnl;
   }
   const pnlOpen = S.trades.reduce((a, t) => a + (t.pnl || 0), 0);
-  const pnlClosed = S.closed.reduce((a, t) => a + t.pnl, 0);
+  const pnlClosed = realClosed.reduce((a, t) => a + t.pnl, 0);
   const pnlTot = pnlClosed + pnlOpen;
   if (pnlTot < S.pnlLow) S.pnlLow = pnlTot;
   const s9 = {
@@ -1038,13 +1065,15 @@ function sseState(force) {
     Pp: { cap: P.CAP, s1: P.STAKE, s2: P.STAKE_MID, s3: P.STAKE_MAX, fs: FORCE_STAKE,
           sl: P.SL, tp: P.TP, tr: P.TRAIL, tpr: P.TP_RANGE, kill: P.CAP * P.KILL },
     cap: P.CAP, paperCap: S.paperCap, wallet: S.walletNow, sessionPnl: S.sessionPnl, unreal: S.unreal,
+    avail: S.avail, inTrades: S.trades.reduce((a, t) => a + (t.stake || 0), 0),
+    mult: m9, killFloor: S.pnlHigh - P.CAP * P.KILL,
     netReel: S.netReel,
     open: S.trades.map(t => ({ id: t.id, dir: t.dir, via: t.via, mode: t.mode, lev: t.lev, entry: t.entry, qty: t.qty,
       stake: t.stake, pnl: t.pnl, tpLocked: t.tpLocked, sl: t.sl, tp: t.tp,
       slOk: !!(t.bnIds && t.bnIds.sl) || ENGINE_MODE === 'paper', tpOk: !!(t.bnIds && t.bnIds.tp) || ENGINE_MODE === 'paper' })),
-    closedN: S.closed.length, wins, wr: S.closed.length ? Math.round(100 * wins / S.closed.length) : null,
+    closedN: realClosed.length, wins, wr: realClosed.length ? Math.round(100 * wins / realClosed.length) : null,
     viaStats,
-    lastClosed: S.closed.slice(-15).reverse().map(t => ({ dir: t.dir, via: t.via, lev: t.lev, entry: t.entry,
+    lastClosed: realClosed.slice(-100).reverse().map(t => ({ dir: t.dir, via: t.via, lev: t.lev, entry: t.entry,
       exit: t.exit, stake: t.stake, pnl: t.pnl, reason: t.reason, dur: (t.closeTime || 0) - (t.openTime || 0) })),
     lastDiag: S.diag.length ? S.diag[S.diag.length - 1] : null,
     funnelTop: Object.entries(S.funnel).sort((a, b) => b[1] - a[1]).slice(0, 3)
@@ -1101,10 +1130,7 @@ app.post('/api/engine/start', async (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 // Arret protege : exige les premiers caracteres de la cle armee (personne d'autre ne peut arreter ton bot)
-app.post('/api/engine/stop', (req, res) => {
-  const { keyPrefix } = req.body || {};
-  if (!E_KEY || !keyPrefix || String(keyPrefix).length < 8 || !E_KEY.startsWith(String(keyPrefix)))
-    return res.status(403).json({ ok: false, error: 'verification refusee (prefixe de cle)' });
+app.post('/api/engine/stop', (req, res) => {   // decret 07/07 : commande sans verification
   S.running = false; S.paused = false;
   E_KEY = ''; E_SECRET = '';   // ARRET total : cles effacees de la RAM — re-armer pour reprendre
   jlog('sys', '⏹ ARRET TOTAL — cles effacees de la RAM. Les SL/TP natifs des positions restent VIVANTS chez Binance.');
@@ -1114,9 +1140,7 @@ app.post('/api/engine/stop', (req, res) => {
 
 // ⏸/▶ PAUSE des entrees (les positions ouvertes restent gerees, flux et exits actifs)
 app.post('/api/engine/pause', (req, res) => {
-  const { keyPrefix, pause } = req.body || {};
-  if (!E_KEY || !keyPrefix || String(keyPrefix).length < 8 || !E_KEY.startsWith(String(keyPrefix)))
-    return res.status(403).json({ ok: false, error: 'verification refusee (prefixe de cle)' });
+  const { pause } = req.body || {};   // decret 07/07 : commande sans verification
   if (!S.running) return res.status(409).json({ ok: false, error: 'moteur non arme' });
   S.paused = !!pause;
   jlog('sys', S.paused ? '⏸ PAUSE — nouvelles entrees bloquees (positions ouvertes toujours gerees)'
@@ -1128,9 +1152,7 @@ app.post('/api/engine/pause', (req, res) => {
 // ✋ Fermeture manuelle d'une position (protegee : prefixe de la cle armee)
 app.post('/api/engine/close', async (req, res) => {
   try {
-    const { keyPrefix, id } = req.body || {};
-    if (!E_KEY || !keyPrefix || String(keyPrefix).length < 8 || !E_KEY.startsWith(String(keyPrefix)))
-      return res.status(403).json({ ok: false, error: 'verification refusee (prefixe de cle)' });
+    const { id } = req.body || {};   // decret 07/07 : commande sans verification
     const t = S.trades.find(x => String(x.id) === String(id));
     if (!t) return res.status(404).json({ ok: false, error: 'position introuvable (deja fermee ?)' });
     jlog('sys', `✋ FERMETURE MANUELLE demandee — ${t.dir} ${t.qty} @ marche (stops natifs annules d'abord)`);
@@ -1144,10 +1166,7 @@ app.get('/api/snapshot', (req, res) => {
 });
 
 // 🖐 Entree forcee a la demande (protegee : prefixe de la cle armee requis)
-app.post('/api/engine/force', (req, res) => {
-  const { keyPrefix } = req.body || {};
-  if (!E_KEY || !keyPrefix || String(keyPrefix).length < 8 || !E_KEY.startsWith(String(keyPrefix)))
-    return res.status(403).json({ ok: false, error: 'verification refusee (prefixe de cle)' });
+app.post('/api/engine/force', (req, res) => {   // decret 07/07 : commande sans verification
   if (!S.running) return res.status(409).json({ ok: false, error: 'moteur non arme' });
   if (S.forceReq) return res.status(200).json({ ok: true, note: 'demande deja en attente' });
   S.forceReq = Date.now();
@@ -1161,7 +1180,7 @@ app.get('/api/state', (req, res) => { sseState(true); res.status(200).json({ ok:
 // ═════════════ DASHBOARD INTEGRE (spectateur pur — AUCUNE cle, AUCUNE logique) ═════════════
 const DASH_HTML = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Itachi v7.2 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
+<title>Itachi v7.5 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
 <style>
 :root{--bg:#05070d;--panel:#0a0e17;--surface:#0e1420;--border:#1a2333;--text:#e6edf3;--muted:#7d8ba1;--muted2:#4a5568;--teal:#37e0b0;--blue:#7b87ff;--gold:#d9a441;--red:#ff3b5c;--yellow:#ffc94d}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1226,7 +1245,7 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
 @media(max-width:900px){.app{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--border)}}
 </style></head><body>
 <div class="topbar">
-  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v7.2 SERVER · Srv 4.0 · WR: à mesurer</span></span>
+  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v7.5 SERVER · Srv 4.0 · WR: à mesurer</span></span>
   <span class="tright">
     <span class="src"><i>●</i> Prix Binance live</span>
     <span class="badge" id="bMode">—</span>
@@ -1252,7 +1271,8 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
   <div class="row"><span class="l">Activation trail</span><b class="teal" id="pTP">— (Binance)</b></div>
   <div class="row"><span class="l">Trailing natif</span><b class="teal" id="pTR">— pic (Binance)</b></div>
   <div class="row"><span class="l">TP fixe RANGE</span><b class="teal" id="pTPR">—</b></div>
-  <div class="row"><span class="l">Kill switch</span><b class="red" id="pKill">—</b></div>
+  <div class="row"><span class="l">Kill switch (suiveur)</span><b class="red" id="pKill">—</b></div>
+  <div class="row"><span class="l">📶 Palier de mise</span><b class="teal" id="pMult">×1.00</b></div>
   <h4>🔗 BINANCE — CONNEXION</h4>
   <div class="warn">⚠ ARGENT RÉEL · Ton compte Binance<br>fapi.binance.com — clés en RAM, jamais stockées</div>
   <div class="l" style="font-size:10px;color:var(--muted);letter-spacing:1px;margin-top:6px">API KEY</div>
@@ -1261,7 +1281,7 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
   <input id="kSec" type="password" placeholder="Colle ton secret API" autocomplete="off">
   <button class="btn go" id="bStart">🔐 Connecter + ▶ ARMER LIVE</button>
   <button class="btn stop" id="bStop">⏹ ARRÊT total — efface les clés</button>
-  <button class="btn" id="bForce" style="background:transparent;color:var(--yellow);border:1px solid var(--yellow)">🖐 Forcer l'entrée — exécute ≤ 1min30 (vérif : clé)</button>
+  <button class="btn" id="bForce" style="background:transparent;color:var(--yellow);border:1px solid var(--yellow)">🖐 Forcer l'entrée — exécute ≤ 1min30</button>
   <div id="kMsg">Moteur non armé — colle tes clés puis ▶ (à refaire après chaque redéploiement Railway)</div>
   <div class="netbox">💰 <b>NET RÉEL Binance (session)</b><br>
     Net: <b id="nNet" class="teal">—</b> · brut <span id="nBrut">—</span><br>
@@ -1282,6 +1302,8 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
     <div class="st"><div class="l">CAPITAL</div><div class="v teal" id="sCap">—</div></div>
     <div class="st"><div class="l">P&L TOTAL</div><div class="v" id="sTot">—</div></div>
     <div class="st"><div class="l">P&L OPEN</div><div class="v" id="sOpen">—</div></div>
+    <div class="st"><div class="l">💵 DISPO</div><div class="v teal" id="sAvail">—</div></div>
+    <div class="st"><div class="l">📦 EN TRADES</div><div class="v yel" id="sInT">—</div></div>
     <div class="st"><div class="l">📂 OUVERTS</div><div class="v yel" id="sN">0</div></div>
     <div class="st"><div class="l">📁 FERMÉS</div><div class="v" id="sF">0</div></div>
     <div class="st"><div class="l">✅ GAGNÉS</div><div class="v teal" id="sW">0</div></div>
@@ -1293,7 +1315,7 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
   </div>
   <section>
     <div class="sechead"><span>POSITIONS</span><span id="posN" class="mut">0 actives</span></div>
-    <table><thead><tr><th>SENS</th><th>VIA</th><th>MODE</th><th>LEV</th><th>MISE</th><th>ENTRÉE</th><th>QTY</th><th>SL (posé ✓)</th><th>TP (posé ✓)</th><th>P&L</th><th></th></tr></thead>
+    <table><thead><tr><th>SENS</th><th>VIA</th><th>MODE</th><th>LEV</th><th>MISE</th><th>ENTRÉE</th><th>QTY</th><th>SL 🔒 perte max</th><th>TP ✓ · 🔒 gain min</th><th>P&L</th><th></th></tr></thead>
     <tbody id="tOpen"><tr><td colspan="11" class="mut">Aucune position</td></tr></tbody></table>
   </section>
   <section>
@@ -1307,8 +1329,8 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
   </section>
   <section>
     <div class="sechead"><span>HISTORIQUE — TRADES FERMÉS</span></div>
-    <table><thead><tr><th>#</th><th>SENS</th><th>LEVIER</th><th>ENTRÉE</th><th>SORTIE</th><th>INVESTI</th><th>GAIN / PERTE</th><th>RENDEMENT</th><th>RAISON</th><th>DURÉE</th></tr></thead>
-    <tbody id="tHist"><tr><td colspan="10" class="mut">Aucun trade fermé pour l'instant</td></tr></tbody></table>
+    <div style="max-height:340px;overflow-y:auto"><table><thead><tr><th>#</th><th>SENS</th><th>LEVIER</th><th>ENTRÉE</th><th>SORTIE</th><th>INVESTI</th><th>GAIN / PERTE</th><th>RENDEMENT</th><th>RAISON</th><th>DURÉE</th></tr></thead>
+    <tbody id="tHist"><tr><td colspan="10" class="mut">Aucun trade fermé pour l'instant</td></tr></tbody></table></div>
   </section>
 </div>
 </div>
@@ -1361,7 +1383,8 @@ function render(s){
   if(s.Pp){$('pCap').textContent='$'+fp(s.Pp.cap,0);$('pS1').textContent='$'+s.Pp.s1;$('pS2').textContent='$'+s.Pp.s2;$('pS3').textContent='$'+s.Pp.s3;$('pFS').textContent='$'+s.Pp.fs+' ×12';
     $('pSL').textContent='-'+(s.Pp.sl*100).toFixed(1)+'% (Binance)';$('pTP').textContent='+'+(s.Pp.tp*100).toFixed(1)+'% (Binance)';
     $('pTR').textContent='-'+(s.Pp.tr*100).toFixed(1)+'% pic (Binance)';$('pTPR').textContent='+'+(s.Pp.tpr*100).toFixed(1)+'%';
-    $('pKill').textContent='-$'+fp(s.Pp.kill,0)+' réel'}
+    $('pKill').textContent=(s.killFloor!=null?((s.killFloor>=0?'coupe à +$':'coupe à -$')+Math.abs(s.killFloor).toFixed(0)):'-$'+fp(s.Pp.kill,0))+' (HWM−'+fp(s.Pp.kill,0)+')'}
+  if(s.mult!=null)$('pMult').textContent='×'+s.mult.toFixed(2);
   lastPrice=s.price||0;if(s.closes)chartCloses=s.closes;
   $('bigpx').textContent='$'+fp(s.price,2);$('sPx').textContent='$'+fp(s.price,2);
   if(s.chg24!=null){$('bigpct').textContent=(s.chg24>=0?'+':'')+s.chg24.toFixed(2)+'%';$('bigpct').className=s.chg24>=0?'teal':'red'}
@@ -1381,12 +1404,14 @@ function render(s){
   $('sCap').textContent='$'+fp(s.Pp?s.Pp.cap:0,2);
   $('sTot').textContent=money(s.pnlClosed);$('sTot').className='v '+((s.pnlClosed||0)>=0?'teal':'red');
   $('sOpen').textContent=money(s.pnlOpen);$('sOpen').className='v '+((s.pnlOpen||0)>=0?'teal':'red');
+  $('sAvail').textContent=s.avail!=null?'$'+fp(s.avail,0):'—';
+  $('sInT').textContent='$'+fp(s.inTrades||0,0);
   $('sN').textContent=s.open.length;$('sF').textContent=s.closedN;$('sW').textContent=s.wins;$('sL').textContent=s.closedN-s.wins;
   $('sWR').textContent=s.wr==null?'—':s.wr+'%';
   $('sDD').textContent=(s.ddPct||0).toFixed(2)+'%';
   $('posN').textContent=s.open.length+' actives';
   $('tOpen').innerHTML=s.open.length?s.open.map(function(t){
-    return '<tr><td class="'+(t.dir==='LONG'?'teal':'red')+'"><b>'+t.dir+'</b></td><td class="mut">'+t.via+'</td><td>'+(t.mode==='RANGE'?'◆ MR':t.mode==='FORCE'?'⚡':t.tpLocked?'🟢 TRAIL':'⏳')+'</td><td>×'+t.lev+'</td><td class="yel">$'+fp(t.stake,0)+'</td><td>'+fp(t.entry,1)+'</td><td>'+t.qty+'</td><td class="red">'+fp(t.sl,1)+(t.slOk?' <span class="teal">✓</span>':' <span class="yel">⏳</span>')+'</td><td class="teal">'+fp(t.tp,1)+(t.tpOk?' <span class="teal">✓</span>':' <span class="yel">⏳</span>')+'</td><td class="'+(t.pnl>=0?'teal':'red')+'"><b>'+money(t.pnl)+'</b></td><td><button class="xbtn" data-id="'+t.id+'" title="Fermer au marche">✕ Fermer</button></td></tr>'
+    return '<tr><td class="'+(t.dir==='LONG'?'teal':'red')+'"><b>'+t.dir+'</b></td><td class="mut">'+t.via+'</td><td>'+(t.mode==='RANGE'?'◆ MR':t.mode==='FORCE'?'⚡':t.tpLocked?'🟢 TRAIL':'⏳')+'</td><td>×'+t.lev+'</td><td class="yel">$'+fp(t.stake,0)+'</td><td>'+fp(t.entry,1)+'</td><td>'+t.qty+'</td><td class="red">'+fp(t.sl,1)+(t.slOk?' <span class="teal">🔒</span>':' <span class="yel">⏳</span>')+'</td><td class="teal">'+fp(t.tp,1)+(t.tpOk?' <span class="teal">✓</span>':' <span class="yel">⏳</span>')+(t.tpLocked?' <span class="teal">🔒</span>':'')+'</td><td class="'+(t.pnl>=0?'teal':'red')+'"><b>'+money(t.pnl)+'</b></td><td><button class="xbtn" data-id="'+t.id+'" title="Fermer au marche">✕ Fermer</button></td></tr>'
   }).join(''):'<tr><td colspan="11" class="mut">Aucune position</td></tr>';
   var vs=Object.keys(s.viaStats||{});
   $('tVia').innerHTML=vs.length?vs.map(function(v){var x=s.viaStats[v];
@@ -1404,12 +1429,6 @@ function render(s){
   if(s.armed&&s.running&&!s.paused)$('kMsg').textContent='✅ Moteur ARMÉ et en marche — tu peux fermer cette page, le bot continue.';
   drawChart();
 }
-var kPref='';
-function pref(){
-  var k=kPref||$('kKey').value.trim().slice(0,16);
-  if(!k||k.length<8){$('kMsg').textContent='Verification : colle les 8+ premiers caracteres de ta cle dans API KEY';return null}
-  return k;
-}
 var btnMode='arm';
 $('bStart').onclick=function(){
   if(btnMode==='arm'){
@@ -1419,29 +1438,26 @@ $('bStart').onclick=function(){
     fetch('/api/engine/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,secret:s2})})
     .then(function(r){return r.json()}).then(function(d){
       $('kMsg').textContent=d.ok?'✅ MOTEUR LIVE ARMÉ — tu peux fermer cette page, le bot continue.':'⚠ '+(d.error||d.hint||'échec')+(d.detail?' — '+d.detail.join(' · '):'');
-      if(d.ok){kPref=k.slice(0,16);$('kKey').value='';$('kSec').value=''}
+      if(d.ok){$('kKey').value='';$('kSec').value=''}
     }).catch(function(e){$('kMsg').textContent='⚠ '+e.message});
     return;
   }
-  var p=pref();if(!p)return;
   var goPause=(btnMode==='pause');
-  fetch('/api/engine/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyPrefix:p,pause:goPause})})
+  fetch('/api/engine/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pause:goPause})})
   .then(function(r){return r.json()}).then(function(d){
     $('kMsg').textContent=d.ok?(goPause?'⏸ PAUSE — nouvelles entrees bloquees, positions toujours gerees.':'▶ REPRISE — entrees reautorisees.'):'⚠ '+(d.error||'refus')
   }).catch(function(e){$('kMsg').textContent='⚠ '+e.message})
 };
 $('bStop').onclick=function(){
-  var p=pref();if(!p)return;
   if(!confirm('ARRET TOTAL : stopper le moteur et effacer les cles de la RAM ?'))return;
-  fetch('/api/engine/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyPrefix:p})})
+  fetch('/api/engine/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})})
   .then(function(r){return r.json()}).then(function(d){
     $('kMsg').textContent=d.ok?'⏹ Moteur arrêté — les SL/TP natifs restent vivants chez Binance.':'⚠ '+(d.error||'refus')
   }).catch(function(e){$('kMsg').textContent='⚠ '+e.message})
 };
-var forceCd=0,FORCE_LBL='🖐 Forcer l&#39;entrée — exécute ≤ 1min30 (vérif : clé)';
+var forceCd=0,FORCE_LBL='🖐 Forcer l&#39;entrée — exécute ≤ 1min30';
 $('bForce').onclick=function(){
-  var p=pref();if(!p)return;
-  fetch('/api/engine/force',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyPrefix:p})})
+  fetch('/api/engine/force',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})})
   .then(function(r){return r.json()}).then(function(d){
     if(d.ok){forceCd=90;$('kMsg').textContent='🖐 Entree forcee demandee — execution a la prochaine cloture 1m'}
     else{$('kMsg').textContent='⚠ '+(d.error||'refus')}
@@ -1450,9 +1466,8 @@ $('bForce').onclick=function(){
 $('tOpen').addEventListener('click',function(ev){
   var b=ev.target&&ev.target.closest?ev.target.closest('button[data-id]'):null;
   if(!b)return;
-  var p=pref();if(!p)return;
   if(!confirm('Fermer cette position au marche, maintenant ?'))return;
-  fetch('/api/engine/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyPrefix:p,id:b.getAttribute('data-id')})})
+  fetch('/api/engine/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:b.getAttribute('data-id')})})
   .then(function(r){return r.json()}).then(function(d){
     $('kMsg').textContent=d.ok?'✋ Position fermee au marche — stops natifs annules.':'⚠ '+(d.error||'refus')
   }).catch(function(e){$('kMsg').textContent='⚠ '+e.message})
@@ -1499,7 +1514,7 @@ app.get('/', (req, res) => {
   res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(DASH_HTML);
 });
-app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v7.2-cap2000', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
+app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v7.5-nolock', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
 
 // ═════════════ DEMARRAGE MOTEUR ═════════════
 async function startEngine() {
@@ -1575,6 +1590,12 @@ if (process.argv.includes('--selftest')) {
     const wrEquilibre = lossNet / (winNet + lossNet);
     assert(Math.abs(wrEquilibre - 0.5) < 1e-9, `RELANCE : WR d'equilibre = ${(wrEquilibre*100).toFixed(1)}% (EV-neutre au coin-flip)`);
     assert(FORCE_STAKE === 350, 'FORCEE : mise fixe 350$ (decret 06/07 soir)');
+    // DECRET 07/07 : mises dynamiques ±5%/100$ bornees [0.30;2.00]
+    assert(sizeMultFor(0) === 1 && sizeMultFor(99) === 1 && sizeMultFor(150) === 1.05, `Paliers hausse: ${sizeMultFor(150)}`);
+    assert(sizeMultFor(-99) === 1 && sizeMultFor(-150) === 0.95, `Paliers baisse: ${sizeMultFor(-150)}`);
+    assert(sizeMultFor(999) === 1.45 && sizeMultFor(100000) === 2 && sizeMultFor(-100000) === 0.3, 'Bornes [0.30;2.00]');
+    // DECRET 07/07 : kill suiveur — HWM 100 → plancher -300 ; HWM 500 → +100
+    assert(100 - 2000*0.20 === -300 && 500 - 2000*0.20 === 100, 'Kill suiveur: HWM-400');
     console.log(ok ? '\n════ SELFTEST COMPLET : TOUT PASSE ════' : '\n════ SELFTEST : ECHECS DETECTES ════');
     process.exit(ok ? 0 : 1);
   })();
