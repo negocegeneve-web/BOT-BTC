@@ -232,7 +232,7 @@ app.post('/api/pnl-reel', async (req, res) => {
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v7.5-nolock', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v8.0-swing', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -398,9 +398,9 @@ const KLINE_BASE  = BN_BASES.mainnet;              // klines toujours mainnet (t
 // ── PARAMETRES STRATEGIQUES (decrets — IMMUABLES sans backtest/decret) ──
 const P = {
   CAP: parseFloat(process.env.CAPITAL || '2000'),   // decret 06/07 soir : capital ref 2000 (kill -20% = -400$)
-  STAKE: 240, STAKE_MID: 320, STAKE_MAX: 560,   // decret 06/07 soir : mises x2 (capital ref 2000$)
-  MAX_OP: 4,
-  LEV_LOW: 3, LEV_MED: 7, LEV_HIGH: 12,
+  STAKE: 750, STAKE_MID: 750, STAKE_MAX: 750,   // DECRET v8 SWING : mise unique 750$ (dynamique ±5%/100$)
+  MAX_OP: 2,   // v8 : 2 positions max
+  LEV_LOW: 12, LEV_MED: 17, LEV_HIGH: 23,   // v8 : levier selon qualite du signal
   SL: 0.008, TP: 0.016, TRAIL: 0.005, TP_RANGE: 0.007,
   KILL: 0.20,
   FEE_SIDE: 0.0005,            // taker mainnet 0.05% par cote (paper)
@@ -421,8 +421,15 @@ const FORCE_AFTER_MS = (parseInt(process.env.FORCE_AFTER_MIN || '30') || 30) * 6
 const FORCE_TP  = 0.007;           // TP fixe +0.7% (TAKE_PROFIT_MARKET natif)
 const FORCE_SL  = 0.005;           // SL -0.5% (STOP_MARKET natif)
 const FORCE_LEV = 12;              // decret : haut levier
-const FORCE_STAKE = 350;           // decret 06/07 soir : mise forcee (RELANCE + bouton) = 350$
-const FORCE_TIMEOUT_MS = (parseInt(process.env.FORCE_TIMEOUT_MIN || '30') || 30) * 60000; // sortie rapide : time-stop
+const FORCE_STAKE = 750;           // v8 : relance/manuel alignes sur la mise unique
+const FORCE_TIMEOUT_MS = (parseInt(process.env.FORCE_TIMEOUT_MIN || '30') || 30) * 60000; // (v8: remplace par TIME_STOP_MS)
+// ── DECRET 07/07 soir : v8 SWING — sorties en % de MISE, UNIFIEES pour toutes les voies ──
+const SWING_SL_M  = 0.30;   // SL = -30% de la mise
+const SWING_ARM_M = 0.60;   // armement du trailing = +60% de la mise
+const SWING_CB_M  = 0.20;   // callback = 20 points de mise sous le pic → plancher ~+40%
+const TIME_STOP_MS = 4 * 3600 * 1000;   // garde-temps 4h (decret) puis retour au cycle
+const KILL_MODE = (process.env.KILL_MODE || 'off').toLowerCase();   // decret : kill OFF — SL seuls gardiens (KILL_MODE=on pour reactiver)
+function cbRate(lev) { return Math.min(10, Math.max(0.1, Math.round((SWING_CB_M / lev) * 1000) / 10)); } // callbackRate Binance (%, pas 0.1)
 const QTY_DEC = SYMBOL === 'BTCUSDT' ? 3 : 0;      // precision quantite
 const PX_DEC  = SYMBOL === 'BTCUSDT' ? 1 : 2;      // precision prix
 
@@ -702,7 +709,7 @@ function onCandleClose(k) {
     } else if (S.regime !== 'WARMUP') {
       const dirM = S.pdi > S.ndi ? 'LONG' : S.ndi > S.pdi ? 'SHORT' : (close >= (sig.es || close) ? 'LONG' : 'SHORT');
       wantDir = dirM; via = 'FORCE-manuel'; mode = 'FORCE'; qEff = 0;
-      jlog('buy', `🖐 ENTREE FORCEE (bouton) — ${dirM} (biais +DI ${S.pdi.toFixed(1)} / -DI ${S.ndi.toFixed(1)}) | x${FORCE_LEV} | $${FORCE_STAKE} | TP +${(FORCE_TP*100).toFixed(1)}% / SL -${(FORCE_SL*100).toFixed(1)}% / time-stop`);
+      jlog('buy', `🖐 ENTREE FORCEE (bouton) — ${dirM} (biais +DI ${S.pdi.toFixed(1)} / -DI ${S.ndi.toFixed(1)}) | $${FORCE_STAKE} | sorties v8: SL -30% mise · trail +60%→plancher +40% · garde 4h`);
     }
   }
 
@@ -710,7 +717,7 @@ function onCandleClose(k) {
   if (!wantDir && FORCE_MODE && S.regime !== 'WARMUP' && S.trades.length === 0
       && Date.now() - S.lastEntry >= FORCE_AFTER_MS) {
     const dirF = S.pdi > S.ndi ? 'LONG' : S.ndi > S.pdi ? 'SHORT' : (close >= (sig.es || close) ? 'LONG' : 'SHORT');
-    jlog('buy', `⚡ MODE RELANCE — ${Math.round(FORCE_AFTER_MS/60000)} min sans entree → entree forcee ${dirF} (biais +DI ${S.pdi.toFixed(1)} / -DI ${S.ndi.toFixed(1)}) | x${FORCE_LEV} | TP +${(FORCE_TP*100).toFixed(1)}% / SL -${(FORCE_SL*100).toFixed(1)}% / time-stop ${Math.round(FORCE_TIMEOUT_MS/60000)}min`);
+    jlog('buy', `⚡ MODE RELANCE — ${Math.round(FORCE_AFTER_MS/60000)} min sans entree → entree forcee ${dirF} (biais +DI ${S.pdi.toFixed(1)} / -DI ${S.ndi.toFixed(1)}) | $${FORCE_STAKE} | sorties v8: SL -30% mise · trail +60%→plancher +40% · garde 4h`);
     recordDiag(k, sig, dx, 'ENTREE_FORCE-30min');
     openPosition(dirF, close, FORCE_LEV, 0, 'FORCE-30min', 'FORCE');
     return;
@@ -756,20 +763,20 @@ async function openPosition(dir, price, lev, q, via, mode) {
   const stake = Math.round((mode === 'FORCE' ? FORCE_STAKE : getStake(q)) * mult * 100) / 100;   // mises dynamiques (decret 07/07)
   const qty = Math.floor((stake * lev / price) * Math.pow(10, QTY_DEC)) / Math.pow(10, QTY_DEC);
   if (qty <= 0) { jlog('sell', '⚠ Quantite nulle — entree annulee'); return; }
-  const SL_PCT = mode === 'FORCE' ? FORCE_SL : P.SL;
-  const TP_PCT = mode === 'FORCE' ? FORCE_TP : mode === 'RANGE' ? P.TP_RANGE : P.TP;
+  // v8 SWING : distances prix = %mise / levier — memes regles pour TOUTES les voies
+  const SL_PCT = SWING_SL_M / lev;                   // -30% de mise
+  const TP_PCT = SWING_ARM_M / lev;                  // +60% de mise = armement du trailing
+  const CB = cbRate(lev);                            // callback (%) ≈ 20 pts de mise sous le pic
   const sl = dir === 'LONG' ? price * (1 - SL_PCT) : price * (1 + SL_PCT);
   const tp = dir === 'LONG' ? price * (1 + TP_PCT) : price * (1 - TP_PCT);
 
   const t = {
     id: Date.now() + Math.random(), dir, entry: price, lev, qty, stake, q, via, mode,
-    sl, tp, slPct: SL_PCT, tpPct: TP_PCT, tpLocked: false, bestPricePct: 0,
+    sl, tp, slPct: SL_PCT, tpPct: TP_PCT, cbPct: CB / 100, tpLocked: false, bestPricePct: 0,
     pnl: 0, openTime: Date.now(), bnIds: null
   };
 
-  const exitTag = mode === 'RANGE'
-    ? `SL:${sl.toFixed(PX_DEC)} TP FIXE:${tp.toFixed(PX_DEC)} (+${(P.TP_RANGE*100).toFixed(1)}%)`
-    : `SL:${sl.toFixed(PX_DEC)} ARM:${tp.toFixed(PX_DEC)} (trail -${(P.TRAIL*100).toFixed(1)}%)`;
+  const exitTag = `SL:${sl.toFixed(PX_DEC)} (-30% mise) ARM:${tp.toFixed(PX_DEC)} (+60%) trail ${CB}% → plancher ~+40%`;
 
   if (ENGINE_MODE === 'paper') {
     S.trades.push(t); S.lastEntry = Date.now();
@@ -806,15 +813,12 @@ async function openPosition(dir, price, lev, q, via, mode) {
     if (slO && slO.orderId) { t.bnIds.sl = slO.orderId; t.bnIds.slAlgo = !!slO.algo; }
 
     // Sortie native selon le mode
-    const tpO = (mode === 'RANGE' || mode === 'FORCE')
-      ? await placeConditional(E_BASE, { symbol: SYMBOL, side: closeSide, type: 'TAKE_PROFIT_MARKET',
-          stopPrice: tp.toFixed(PX_DEC), quantity: qtyStr, reduceOnly: 'true' }, E_KEY, E_SECRET)
-      : await placeConditional(E_BASE, { symbol: SYMBOL, side: closeSide, type: 'TRAILING_STOP_MARKET',
-          activationPrice: tp.toFixed(PX_DEC), callbackRate: (P.TRAIL * 100).toFixed(1),
+    const tpO = await placeConditional(E_BASE, { symbol: SYMBOL, side: closeSide, type: 'TRAILING_STOP_MARKET',
+          activationPrice: tp.toFixed(PX_DEC), callbackRate: CB.toFixed(1),
           quantity: qtyStr, reduceOnly: 'true' }, E_KEY, E_SECRET);
     if (tpO && tpO.orderId) { t.bnIds.tp = tpO.orderId; t.bnIds.tpAlgo = !!tpO.algo; }
 
-    const exitLbl = (mode === 'RANGE' || mode === 'FORCE') ? `TP FIXE ${tp.toFixed(PX_DEC)}` : `TRAILING natif (arm ${tp.toFixed(PX_DEC)}, cb ${(P.TRAIL*100).toFixed(1)}%)`;
+    const exitLbl = `TRAILING natif (arm ${tp.toFixed(PX_DEC)}, cb ${CB}%)`;
     if (t.bnIds.sl && t.bnIds.tp) jlog('sys', `✅ SL ${sl.toFixed(PX_DEC)} + ${exitLbl} poses cote Binance`);
     else jlog('sell', `⚠ Protection PARTIELLE — SL:${t.bnIds.sl ? 'OK' : 'ECHEC'} SORTIE:${t.bnIds.tp ? 'OK' : 'ECHEC'}`);
 
@@ -871,19 +875,11 @@ function paperManage() {
     const pct = t.dir === 'LONG' ? (price - t.entry) / t.entry : (t.entry - price) / t.entry;
     if (pct > t.bestPricePct) t.bestPricePct = pct;
     t.pnl = pct * t.stake * t.lev - t.stake * t.lev * P.FEE_SIDE * 2;
-    if (t.mode === 'FORCE') {
-      if (pct <= -FORCE_SL)   { closePosition(t, price, `🔴 SL relance -${(FORCE_SL*100).toFixed(1)}%`, false); continue; }
-      if (pct >= FORCE_TP)    { closePosition(t, price, `✅ TP relance +${(FORCE_TP*100).toFixed(1)}%`, false); continue; }
-      if (Date.now() - t.openTime >= FORCE_TIMEOUT_MS) { closePosition(t, price, `⏱ Time-stop relance ${Math.round(FORCE_TIMEOUT_MS/60000)}min`, false); continue; }
-    } else if (t.mode === 'RANGE') {
-      if (pct <= -P.SL)       { closePosition(t, price, `🔴 SL -${(P.SL*100).toFixed(1)}%`, false); continue; }
-      if (pct >= P.TP_RANGE)  { closePosition(t, price, `✅ TP fixe +${(P.TP_RANGE*100).toFixed(1)}%`, false); continue; }
-    } else {
-      if (!t.tpLocked && pct >= P.TP) { t.tpLocked = true; jlog('info', `🟢 TRAIL ARME ${t.dir} +${(pct*100).toFixed(2)}%`); }
-      if (!t.tpLocked && pct <= -P.SL) { closePosition(t, price, `🔴 SL -${(P.SL*100).toFixed(1)}%`, false); continue; }
-      if (t.tpLocked && pct <= t.bestPricePct - P.TRAIL) {
-        closePosition(t, price, `✅ Trail +${((t.bestPricePct - P.TRAIL)*100).toFixed(2)}%`, false); continue;
-      }
+    if (Date.now() - t.openTime >= TIME_STOP_MS) { closePosition(t, price, '⏱ Garde-temps 4h', false); continue; }
+    if (!t.tpLocked && pct >= t.tpPct) { t.tpLocked = true; jlog('info', `🟢 TRAIL ARME ${t.dir} (+60% mise atteints)`); }
+    if (!t.tpLocked && pct <= -t.slPct) { closePosition(t, price, '🔴 SL -30% mise', false); continue; }
+    if (t.tpLocked && pct <= t.bestPricePct - t.cbPct) {
+      closePosition(t, price, `✅ Trailing (pic +${(t.bestPricePct*100).toFixed(2)}% px)`, false); continue;
     }
   }
 }
@@ -924,9 +920,12 @@ async function reconcile() {
       // PURGE des ordres orphelins des sessions passees AVANT d'en poser un neuf (la source de la boucle)
       await bnCall(E_BASE, '/fapi/v1/allOpenOrders', 'DELETE', { symbol: SYMBOL }, E_KEY, E_SECRET);
       jlog('sys', '🧹 Ordres orphelins purges avant adoption (allOpenOrders)');
-      const t = { id: Date.now(), dir, entry, lev: Math.max(1, parseInt(row.leverage || '3')), qty: Math.abs(net),
-                  stake: P.STAKE, q: 50, via: 'ADOPTE', mode: 'TREND', sl: dir === 'LONG' ? entry * (1 - P.SL) : entry * (1 + P.SL),
-                  tp: dir === 'LONG' ? entry * (1 + P.TP) : entry * (1 - P.TP), slPct: P.SL, tpPct: P.TP,
+      const aLev = Math.max(1, parseInt(row.leverage || '12'));
+      const t = { id: Date.now(), dir, entry, lev: aLev, qty: Math.abs(net),
+                  stake: P.STAKE, q: 50, via: 'ADOPTE', mode: 'TREND',
+                  sl: dir === 'LONG' ? entry * (1 - SWING_SL_M / aLev) : entry * (1 + SWING_SL_M / aLev),
+                  tp: dir === 'LONG' ? entry * (1 + SWING_ARM_M / aLev) : entry * (1 - SWING_ARM_M / aLev),
+                  slPct: SWING_SL_M / aLev, tpPct: SWING_ARM_M / aLev, cbPct: cbRate(aLev) / 100,
                   tpLocked: false, bestPricePct: 0, pnl: 0, openTime: Date.now(), bnIds: { entry: 0, sl: null, tp: null } };
       const closeSide = dir === 'LONG' ? 'SELL' : 'BUY';
       const slO = await placeConditional(E_BASE, { symbol: SYMBOL, side: closeSide, type: 'STOP_MARKET',
@@ -946,7 +945,7 @@ async function reconcile() {
         S.sessionPnl = (S.walletNow + S.unreal) - S.walletStart;
         if (S.sessionPnl > S.pnlHigh) S.pnlHigh = S.sessionPnl;   // plus-haut de session (high-water mark)
         const killFloor = S.pnlHigh - (P.CAP * P.KILL);            // DECRET 07/07 : kill SUIVEUR = HWM - 400$
-        if (!S.killed && S.sessionPnl <= killFloor) {
+        if (KILL_MODE === 'on' && !S.killed && S.sessionPnl <= killFloor) {   // decret v8 : OFF par defaut
           S.killed = true;
           jlog('sell', `⛔ KILL SUIVEUR — P&L session ${S.sessionPnl.toFixed(2)}$ <= plancher ${killFloor.toFixed(2)}$ (plus-haut ${S.pnlHigh.toFixed(2)}$ - ${(P.CAP*P.KILL).toFixed(0)}$) — FERMETURE TOTALE + ARRET`);
           for (const t of [...S.trades]) await closePosition(t, S.price, '⛔ KILL REEL', true);
@@ -1000,10 +999,10 @@ async function pollLoop() {
       for (const t of [...S.trades]) {
         const pct = t.dir === 'LONG' ? (S.price - t.entry) / t.entry : (t.entry - S.price) / t.entry;
         if (pct > t.bestPricePct) t.bestPricePct = pct;
-        if (t.mode === 'TREND' && !t.tpLocked && pct >= P.TP) { t.tpLocked = true; jlog('info', `🟢 TRAIL ARME ${t.dir} (suivi par BINANCE natif)`); }
+        if (!t.tpLocked && pct >= t.tpPct) { t.tpLocked = true; jlog('info', `🟢 TRAIL ARME ${t.dir} (+60% mise — suivi par BINANCE natif)`); }
         t.pnl = pct * t.stake * t.lev - t.stake * t.lev * P.FEE_SIDE * 2;
-        if (t.mode === 'FORCE' && Date.now() - t.openTime >= FORCE_TIMEOUT_MS) {
-          await closePosition(t, S.price, `⏱ Time-stop relance ${Math.round(FORCE_TIMEOUT_MS/60000)}min`, true);
+        if (Date.now() - t.openTime >= TIME_STOP_MS) {
+          await closePosition(t, S.price, '⏱ Garde-temps 4h', true);
         }
       }
     }
@@ -1062,8 +1061,8 @@ function sseState(force) {
                flat: S.trades.length === 0, pending: !!S.forceReq, on: FORCE_MODE },
     closes: S.candles1m.slice(-170).map(c => c.c),
     pnlOpen, pnlClosed, ddPct: S.pnlLow < 0 ? (-S.pnlLow / P.CAP * 100) : 0,
-    Pp: { cap: P.CAP, s1: P.STAKE, s2: P.STAKE_MID, s3: P.STAKE_MAX, fs: FORCE_STAKE,
-          sl: P.SL, tp: P.TP, tr: P.TRAIL, tpr: P.TP_RANGE, kill: P.CAP * P.KILL },
+    Pp: { cap: P.CAP, stake: P.STAKE, fs: FORCE_STAKE, slM: SWING_SL_M, armM: SWING_ARM_M, cbM: SWING_CB_M,
+          tsH: TIME_STOP_MS / 3600000, kill: P.CAP * P.KILL, killMode: KILL_MODE },
     cap: P.CAP, paperCap: S.paperCap, wallet: S.walletNow, sessionPnl: S.sessionPnl, unreal: S.unreal,
     avail: S.avail, inTrades: S.trades.reduce((a, t) => a + (t.stake || 0), 0),
     mult: m9, killFloor: S.pnlHigh - P.CAP * P.KILL,
@@ -1106,7 +1105,7 @@ app.get('/api/why', (req, res) => {
       'TREND_Q<50': 'direction alignee au regime mais qualite insuffisante',
       TREND_SANS_PULLBACK: 'tendance en extension — pas de retour sur EMA21 a jouer',
       TREND_SANS_REPRISE: 'pullback present mais la reprise dans le sens du regime manque encore',
-      'ENTREE_FORCE-30min': 'MODE RELANCE (decret) : 30 min sans entree, a plat → entree forcee au biais DI, x12, TP+0.7/SL-0.5/time-stop'
+      'ENTREE_FORCE-30min': 'MODE RELANCE (decret) : 30 min sans entree, a plat → entree forcee au biais DI, sorties v8 unifiees'
     },
     derniers_verdicts: S.diag.slice(-30).reverse()
   });
@@ -1180,7 +1179,7 @@ app.get('/api/state', (req, res) => { sseState(true); res.status(200).json({ ok:
 // ═════════════ DASHBOARD INTEGRE (spectateur pur — AUCUNE cle, AUCUNE logique) ═════════════
 const DASH_HTML = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Itachi v7.5 SERVER — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
+<title>Itachi v8.0 SWING — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
 <style>
 :root{--bg:#05070d;--panel:#0a0e17;--surface:#0e1420;--border:#1a2333;--text:#e6edf3;--muted:#7d8ba1;--muted2:#4a5568;--teal:#37e0b0;--blue:#7b87ff;--gold:#d9a441;--red:#ff3b5c;--yellow:#ffc94d}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1245,7 +1244,7 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
 @media(max-width:900px){.app{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--border)}}
 </style></head><body>
 <div class="topbar">
-  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v7.5 SERVER · Srv 4.0 · WR: à mesurer</span></span>
+  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v8.0 SWING · Srv 4.0 · WR: à mesurer</span></span>
   <span class="tright">
     <span class="src"><i>●</i> Prix Binance live</span>
     <span class="badge" id="bMode">—</span>
@@ -1257,20 +1256,18 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
 <div class="side">
   <h4>PARAMÈTRES BOT</h4>
   <div class="row"><span class="l">Capital référence</span><b class="teal" id="pCap">—</b></div>
-  <div class="row"><span class="l">Mise standard</span><b id="pS1">—</b></div>
-  <div class="row"><span class="l">Mise Q≥50</span><b class="yel" id="pS2">—</b></div>
-  <div class="row"><span class="l">Mise max Q≥70</span><b class="yel" id="pS3">—</b></div>
+  <div class="row"><span class="l">Mise (toutes voies)</span><b id="pS1">—</b></div>
   <div class="row"><span class="l">⚡ Relance 30min</span><b id="pFS">—</b></div>
-  <div class="row"><span class="l">Max positions / sens</span><b>2 (esp. 0.3%)</b></div>
+  <div class="row"><span class="l">Max positions</span><b>2 (esp. 0.3%)</b></div>
   <div class="hr"></div>
-  <div class="row"><span class="l">Levier Q &lt; 45</span><b class="teal">3×</b></div>
-  <div class="row"><span class="l">Levier Q 45-69</span><b class="yel">7×</b></div>
-  <div class="row"><span class="l">Levier Q ≥ 70</span><b class="red">12×</b></div>
+  <div class="row"><span class="l">Levier Q &lt; 45</span><b class="teal">12×</b></div>
+  <div class="row"><span class="l">Levier Q 45-69</span><b class="yel">17×</b></div>
+  <div class="row"><span class="l">Levier Q ≥ 70</span><b class="red">23×</b></div>
   <div class="hr"></div>
-  <div class="row"><span class="l">Stop-Loss</span><b class="red" id="pSL">— (Binance)</b></div>
-  <div class="row"><span class="l">Activation trail</span><b class="teal" id="pTP">— (Binance)</b></div>
-  <div class="row"><span class="l">Trailing natif</span><b class="teal" id="pTR">— pic (Binance)</b></div>
-  <div class="row"><span class="l">TP fixe RANGE</span><b class="teal" id="pTPR">—</b></div>
+  <div class="row"><span class="l">Stop-Loss</span><b class="red" id="pSL">−30% mise (Binance)</b></div>
+  <div class="row"><span class="l">Trailing armé à</span><b class="teal" id="pTP">+60% mise (Binance)</b></div>
+  <div class="row"><span class="l">Plancher après armement</span><b class="teal" id="pTR">~+40% mise</b></div>
+  <div class="row"><span class="l">⏱ Garde-temps</span><b class="yel" id="pTPR">4h</b></div>
   <div class="row"><span class="l">Kill switch (suiveur)</span><b class="red" id="pKill">—</b></div>
   <div class="row"><span class="l">📶 Palier de mise</span><b class="teal" id="pMult">×1.00</b></div>
   <h4>🔗 BINANCE — CONNEXION</h4>
@@ -1380,10 +1377,14 @@ function render(s){
   $('bMode').style.color=s.mode==='live'?'var(--red)':s.mode==='paper'?'var(--yellow)':'var(--muted)';
   $('bRun').textContent=s.killed?'⛔ KILL SWITCH':s.running?'● EN MARCHE':'⏸ ARRÊTÉ';
   $('bRun').style.color=s.killed?'var(--red)':s.running?'var(--teal)':'var(--muted)';
-  if(s.Pp){$('pCap').textContent='$'+fp(s.Pp.cap,0);$('pS1').textContent='$'+s.Pp.s1;$('pS2').textContent='$'+s.Pp.s2;$('pS3').textContent='$'+s.Pp.s3;$('pFS').textContent='$'+s.Pp.fs+' ×12';
-    $('pSL').textContent='-'+(s.Pp.sl*100).toFixed(1)+'% (Binance)';$('pTP').textContent='+'+(s.Pp.tp*100).toFixed(1)+'% (Binance)';
-    $('pTR').textContent='-'+(s.Pp.tr*100).toFixed(1)+'% pic (Binance)';$('pTPR').textContent='+'+(s.Pp.tpr*100).toFixed(1)+'%';
-    $('pKill').textContent=(s.killFloor!=null?((s.killFloor>=0?'coupe à +$':'coupe à -$')+Math.abs(s.killFloor).toFixed(0)):'-$'+fp(s.Pp.kill,0))+' (HWM−'+fp(s.Pp.kill,0)+')'}
+  if(s.Pp){$('pCap').textContent='$'+fp(s.Pp.cap,0);
+    $('pS1').textContent='$'+s.Pp.stake+' · dyn ±5%/100$';
+    $('pFS').textContent='$'+s.Pp.fs;
+    $('pSL').textContent='-'+(s.Pp.slM*100).toFixed(0)+'% mise (Binance)';
+    $('pTP').textContent='+'+(s.Pp.armM*100).toFixed(0)+'% mise (Binance)';
+    $('pTR').textContent='~+'+((s.Pp.armM-s.Pp.cbM)*100).toFixed(0)+'% mise garanti';
+    $('pTPR').textContent=s.Pp.tsH+'h · fermeture marché';
+    $('pKill').textContent=(s.Pp.killMode==='on')?(((s.killFloor||0)>=0?'coupe à +$':'coupe à -$')+Math.abs(s.killFloor||0).toFixed(0)+' (HWM−'+fp(s.Pp.kill,0)+')'):'OFF (décret — SL seuls gardiens)'}
   if(s.mult!=null)$('pMult').textContent='×'+s.mult.toFixed(2);
   lastPrice=s.price||0;if(s.closes)chartCloses=s.closes;
   $('bigpx').textContent='$'+fp(s.price,2);$('sPx').textContent='$'+fp(s.price,2);
@@ -1514,14 +1515,14 @@ app.get('/', (req, res) => {
   res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(DASH_HTML);
 });
-app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v7.5-nolock', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
+app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v8.0-swing', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
 
 // ═════════════ DEMARRAGE MOTEUR ═════════════
 async function startEngine() {
   if (ENGINE_MODE === 'off') { console.log('[BOT] ENGINE_MODE=off — serveur en mode PROXY PUR (comportement v3.5). Regler ENGINE_MODE=paper|live + cles pour activer.'); return; }
   if (ENGINE_MODE === 'live' && (!E_KEY || !E_SECRET)) { console.log('[BOT] ⛔ ENGINE_MODE=live mais BINANCE_API_KEY/SECRET absentes — moteur NON demarre.'); return; }
   try {
-    jlog('sys', `🚀 Itachi v6 SERVER · Srv 4.0 · WR: a mesurer — ${ENGINE_MODE.toUpperCase()} ${ENGINE_NET.toUpperCase()} ${SYMBOL} — MULTI-REGIME ADX(14) 5m · SL -0.8% · TREND: trail natif +1.6%/-0.5% · RANGE assoupli (RSI 38/62, plancher QMR>=35 — decret Q35): TP fixe +0.7% · MIN_GAP 1min30 · MAX 2 meme sens (0.3%) · RELANCE 30min (biais DI, x12, TP+0.7/SL-0.5, time-stop, FORCE_MODE=off pour couper) · KILL -${(P.CAP*P.KILL).toFixed(0)}$ reel`);
+    jlog('sys', `🚀 Itachi v8 SWING · Srv 4.0 · WR: a mesurer — ${ENGINE_MODE.toUpperCase()} ${ENGINE_NET.toUpperCase()} ${SYMBOL} — entrees MULTI-REGIME ADX 5m (Q35 range, MIN_GAP 1min30, max 2 pos) · MISE 750$ dyn ±5%/100$ · leviers 12/17/23 par Q · sorties natives UNIFIEES: SL -30% mise, trailing arme +60% → plancher ~+40%, garde-temps 4h · RELANCE 30min 750$ · KILL ${KILL_MODE === 'on' ? 'suiveur HWM-' + (P.CAP*P.KILL).toFixed(0) + '$' : 'OFF (decret — SL seuls gardiens)'}`);
     await seedCandles();
     if (ENGINE_MODE === 'live') {
       const bal = await bnCall(E_BASE, '/fapi/v2/balance', 'GET', {}, E_KEY, E_SECRET);
@@ -1582,14 +1583,14 @@ if (process.argv.includes('--selftest')) {
     assert(qRejet < QMR_MIN, `QMR : RSI 38 sans exces = ${qRejet} < ${QMR_MIN} → refuse`);
     assert(qFort === 99, `QMR extreme = ${qFort}`);
     // Grille decrets
-    assert(getLev(40) === 3 && getLev(60) === 7 && getLev(85) === 12, 'Leviers 3/7/12 par Q');
-    assert(getStake(40) === 240 && getStake(60) === 320 && getStake(85) === 560, 'Mises 240/320/560 par Q (decret 06/07 soir)');
-    // MODE RELANCE : geometrie EV-neutre exacte a WR 50% (frais 0.10% aller-retour inclus)
-    const winNet  = FORCE_TP - 2 * P.FEE_SIDE;   // +0.6%
-    const lossNet = FORCE_SL + 2 * P.FEE_SIDE;   // -0.6%
-    const wrEquilibre = lossNet / (winNet + lossNet);
-    assert(Math.abs(wrEquilibre - 0.5) < 1e-9, `RELANCE : WR d'equilibre = ${(wrEquilibre*100).toFixed(1)}% (EV-neutre au coin-flip)`);
-    assert(FORCE_STAKE === 350, 'FORCEE : mise fixe 350$ (decret 06/07 soir)');
+    assert(getLev(40) === 12 && getLev(60) === 17 && getLev(85) === 23, 'Leviers 12/17/23 par Q (v8)');
+    assert(getStake(40) === 750 && getStake(85) === 750, 'Mise unique 750$ (v8)');
+    // v8 SWING : distances prix = %mise / levier, callbacks arrondis au pas Binance 0.1
+    assert(Math.abs(SWING_SL_M / 12 - 0.025) < 1e-12, 'SL 12x = -2.5% px');
+    assert(cbRate(12) === 1.7 && cbRate(17) === 1.2 && cbRate(23) === 0.9, `Callbacks: ${cbRate(12)}/${cbRate(17)}/${cbRate(23)}`);
+    const floor12 = SWING_ARM_M - (cbRate(12) / 100) * 12;
+    assert(floor12 > 0.39 && floor12 <= 0.40, `Plancher apres armement 12x ≈ +${(floor12*100).toFixed(1)}% de mise`);
+    assert(FORCE_STAKE === 750, 'Relance alignee 750$ (v8)');
     // DECRET 07/07 : mises dynamiques ±5%/100$ bornees [0.30;2.00]
     assert(sizeMultFor(0) === 1 && sizeMultFor(99) === 1 && sizeMultFor(150) === 1.05, `Paliers hausse: ${sizeMultFor(150)}`);
     assert(sizeMultFor(-99) === 1 && sizeMultFor(-150) === 0.95, `Paliers baisse: ${sizeMultFor(-150)}`);
