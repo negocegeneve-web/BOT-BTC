@@ -66,13 +66,18 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ══ 1+2. SYNCHRO HORLOGE + KEEP-WARM (recette Champion, lignes 381-398) ══
 let TIME_OFFSET = 0; // serverTime - horloge locale (ms), lissé
+let WARM_BASE = BN_BASES.mainnet;   // hote a garder chaud (bascule sur l'hote moteur apres la config)
 async function syncTimeAndWarm() {
   try {
+    if (!Number.isFinite(TIME_OFFSET)) TIME_OFFSET = 0;   // v8.2.1 : auto-guerison si jamais corrompu
     const t0 = Date.now();
-    const r  = await fetch((typeof E_BASE !== 'undefined' ? E_BASE : BN_BASES.mainnet) + '/fapi/v1/time', { signal: AbortSignal.timeout(5000) });
+    const r  = await fetch(WARM_BASE + '/fapi/v1/time', { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return;                                    // v8.2.1 : erreur HTTP → echantillon ignore
     const d  = await r.json();
+    if (!d || !Number.isFinite(d.serverTime)) return;     // v8.2.1 : reponse sans serverTime → ignore
     const rtt = Date.now() - t0;
     const offset = d.serverTime + rtt / 2 - Date.now();
+    if (!Number.isFinite(offset)) return;                 // v8.2.1 : jamais de NaN dans le lissage
     TIME_OFFSET = TIME_OFFSET === 0 ? offset : TIME_OFFSET * 0.8 + offset * 0.2; // lissage
   } catch (e) { /* silencieux : le prochain ping réessaie */ }
 }
@@ -81,7 +86,7 @@ async function syncTimeAndWarm() {
 // Renvoie TOUJOURS un objet (jamais de throw) : JSON Binance brut,
 // ou { code:-1007 } sur timeout réseau, ou { code:-1, raw } sur non-JSON.
 async function bnCall(base, path, method, params, apiKey, apiSecret) {
-  const timestamp = Date.now() + Math.round(TIME_OFFSET);
+  const timestamp = Date.now() + (Number.isFinite(TIME_OFFSET) ? Math.round(TIME_OFFSET) : 0);   // v8.2.1 : ceinture
   const query = new URLSearchParams({ ...params, timestamp, recvWindow: 10000 }).toString();
   const signature = crypto.createHmac('sha256', apiSecret).update(query).digest('hex');
   const url = `${base}${path}?${query}&signature=${signature}`;
@@ -232,7 +237,7 @@ app.post('/api/pnl-reel', async (req, res) => {
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v8.2-turbo', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v8.2.1-turbo', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -393,6 +398,7 @@ let E_KEY       = process.env.BINANCE_API_KEY    || '';   // RAM uniquement via 
 let E_SECRET    = process.env.BINANCE_API_SECRET || '';
 const SYMBOL      = (process.env.SYMBOL || 'BTCUSDT').toUpperCase();
 const E_BASE      = BN_BASES[ENGINE_NET];
+WARM_BASE = E_BASE;                                // keep-warm + horloge sur l'hote reel des ordres
 const KLINE_BASE  = BN_BASES.mainnet;              // klines toujours mainnet (testnet = historique pauvre)
 
 // ── PARAMETRES STRATEGIQUES (decrets — IMMUABLES sans backtest/decret) ──
@@ -1210,7 +1216,7 @@ app.get('/api/state', (req, res) => { sseState(true); res.status(200).json({ ok:
 // ═════════════ DASHBOARD INTEGRE (spectateur pur — AUCUNE cle, AUCUNE logique) ═════════════
 const DASH_HTML = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Itachi v8.2 TURBO — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
+<title>Itachi v8.2.1 TURBO — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
 <style>
 :root{--bg:#05070d;--panel:#0a0e17;--surface:#0e1420;--border:#1a2333;--text:#e6edf3;--muted:#7d8ba1;--muted2:#4a5568;--teal:#37e0b0;--blue:#7b87ff;--gold:#d9a441;--red:#ff3b5c;--yellow:#ffc94d}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1275,7 +1281,7 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
 @media(max-width:900px){.app{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--border)}}
 </style></head><body>
 <div class="topbar">
-  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v8.2 TURBO · Srv 4.0 · WR: à mesurer</span></span>
+  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v8.2.1 TURBO · Srv 4.0 · WR: à mesurer</span></span>
   <span class="tright">
     <span class="src"><i>●</i> Prix Binance live</span>
     <span class="badge" id="bMode">—</span>
@@ -1546,14 +1552,14 @@ app.get('/', (req, res) => {
   res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(DASH_HTML);
 });
-app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v8.2-turbo', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
+app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v8.2.1-turbo', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
 
 // ═════════════ DEMARRAGE MOTEUR ═════════════
 async function startEngine() {
   if (ENGINE_MODE === 'off') { console.log('[BOT] ENGINE_MODE=off — serveur en mode PROXY PUR (comportement v3.5). Regler ENGINE_MODE=paper|live + cles pour activer.'); return; }
   if (ENGINE_MODE === 'live' && (!E_KEY || !E_SECRET)) { console.log('[BOT] ⛔ ENGINE_MODE=live mais BINANCE_API_KEY/SECRET absentes — moteur NON demarre.'); return; }
   try {
-    jlog('sys', `🚀 Itachi v8.2 TURBO · Srv 4.0 · WR: a mesurer — poll aligne clotures 1m · SL+trail paralleles · keep-warm hote ordres · retournement Q>=75 confirme cloture 5m (decret 11/07) · ${ENGINE_MODE.toUpperCase()} ${ENGINE_NET.toUpperCase()} ${SYMBOL} — entrees MULTI-REGIME ADX 5m (Q35 range, MIN_GAP 1min30, max 2 pos) · MISE 750$ dyn ±5%/100$ · leviers 12/17/23 par Q · sorties natives UNIFIEES: SL -30% mise, trailing arme +60% → plancher ~+40%, garde-temps 4h · RELANCE 30min 750$ · KILL ${KILL_MODE === 'on' ? 'suiveur HWM-' + (P.CAP*P.KILL).toFixed(0) + '$' : 'OFF (decret — SL seuls gardiens)'}`);
+    jlog('sys', `🚀 Itachi v8.2.1 TURBO · Srv 4.0 · WR: a mesurer — horloge blindee anti-1102 · poll aligne clotures 1m · SL+trail paralleles · keep-warm hote ordres · retournement Q>=75 confirme cloture 5m (decret 11/07) · ${ENGINE_MODE.toUpperCase()} ${ENGINE_NET.toUpperCase()} ${SYMBOL} — entrees MULTI-REGIME ADX 5m (Q35 range, MIN_GAP 1min30, max 2 pos) · MISE 750$ dyn ±5%/100$ · leviers 12/17/23 par Q · sorties natives UNIFIEES: SL -30% mise, trailing arme +60% → plancher ~+40%, garde-temps 4h · RELANCE 30min 750$ · KILL ${KILL_MODE === 'on' ? 'suiveur HWM-' + (P.CAP*P.KILL).toFixed(0) + '$' : 'OFF (decret — SL seuls gardiens)'}`);
     await seedCandles();
     if (ENGINE_MODE === 'live') {
       const bal = await bnCall(E_BASE, '/fapi/v2/balance', 'GET', {}, E_KEY, E_SECRET);
