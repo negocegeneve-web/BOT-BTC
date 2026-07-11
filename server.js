@@ -1645,4 +1645,5 @@ if (process.argv.includes('--selftest')) {
 
 // ══ ECOUTE (apres definition de TOUTES les routes) ══
 if (!process.argv.includes('--selftest')) {
-  app.listen(PORT, () => console.log(`Itachi BOT-BTC v6.0 (Srv 4.0 — proxy + moteur ${ENGINE_MODE.toUpperCase()}) en ecoute sur le port ${
+  app.listen(PORT, () => console.log(`Itachi BOT-BTC v6.0 (Srv 4.0 — proxy + moteur ${ENGINE_MODE.toUpperCase()}) en ecoute sur le port ${PORT}`));
+}
