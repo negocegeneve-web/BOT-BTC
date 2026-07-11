@@ -69,7 +69,7 @@ let TIME_OFFSET = 0; // serverTime - horloge locale (ms), lissé
 async function syncTimeAndWarm() {
   try {
     const t0 = Date.now();
-    const r  = await fetch(BN_BASES.testnet + '/fapi/v1/time', { signal: AbortSignal.timeout(5000) });
+    const r  = await fetch((typeof E_BASE !== 'undefined' ? E_BASE : BN_BASES.mainnet) + '/fapi/v1/time', { signal: AbortSignal.timeout(5000) });
     const d  = await r.json();
     const rtt = Date.now() - t0;
     const offset = d.serverTime + rtt / 2 - Date.now();
@@ -232,7 +232,7 @@ app.post('/api/pnl-reel', async (req, res) => {
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v8.0-swing', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v8.2-turbo', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -401,7 +401,6 @@ const P = {
   STAKE: 750, STAKE_MID: 750, STAKE_MAX: 750,   // DECRET v8 SWING : mise unique 750$ (dynamique ±5%/100$)
   MAX_OP: 2,   // v8 : 2 positions max
   LEV_LOW: 12, LEV_MED: 17, LEV_HIGH: 23,   // v8 : levier selon qualite du signal
-  SL: 0.008, TP: 0.016, TRAIL: 0.005, TP_RANGE: 0.007,
   KILL: 0.20,
   FEE_SIDE: 0.0005,            // taker mainnet 0.05% par cote (paper)
   EMA_F: 8, EMA_S: 21
@@ -418,11 +417,8 @@ const QMR_MIN = 35;                // plancher de qualite mean-reversion decrete
 //  Interrupteur SANS redeploiement : variable Railway FORCE_MODE=off
 const FORCE_MODE     = (process.env.FORCE_MODE || 'on').toLowerCase() !== 'off';
 const FORCE_AFTER_MS = (parseInt(process.env.FORCE_AFTER_MIN || '30') || 30) * 60000;
-const FORCE_TP  = 0.007;           // TP fixe +0.7% (TAKE_PROFIT_MARKET natif)
-const FORCE_SL  = 0.005;           // SL -0.5% (STOP_MARKET natif)
 const FORCE_LEV = 12;              // decret : haut levier
 const FORCE_STAKE = 750;           // v8 : relance/manuel alignes sur la mise unique
-const FORCE_TIMEOUT_MS = (parseInt(process.env.FORCE_TIMEOUT_MIN || '30') || 30) * 60000; // (v8: remplace par TIME_STOP_MS)
 // ── DECRET 07/07 soir : v8 SWING — sorties en % de MISE, UNIFIEES pour toutes les voies ──
 const SWING_SL_M  = 0.30;   // SL = -30% de la mise
 const SWING_ARM_M = 0.60;   // armement du trailing = +60% de la mise
@@ -436,7 +432,8 @@ const PX_DEC  = SYMBOL === 'BTCUSDT' ? 1 : 2;      // precision prix
 // ── ETAT MOTEUR ──
 const S = {
   running: false, killed: false,
-  price: 0, priceChg24h: 0, chg24: null, pnlLow: 0, forceReq: 0, paused: false,
+  price: 0, chg24: null, pnlLow: 0, forceReq: 0, paused: false,
+  revPend: null,               // decret 11/07 : retournement Q>=75 en attente de confirmation 5m
   avail: 0, lastAdoptSig: '', lastAdoptAt: 0, pnlHigh: 0, lastMult: 1,
   candles1m: [],               // clotures 1m {t,h,l,c} (max 240)
   candles5m: [], cur5: null,   // bougies 5m {h,l,c} pour ADX
@@ -700,6 +697,23 @@ function onCandleClose(k) {
       else                                       blocked = 'RANGE_CALME';
     } else blocked = 'RANGE_INDIC_PAS_PRETS';
   }
+  // ── DECRET 11/07 : retournement confirme a la cloture 5m — gestion du flag ──
+  if (S.revPend) {
+    if (!S.trades.some(t => t.dir !== S.revPend.dir)) {
+      S.revPend = null;                                        // plus aucune position opposee : flag caduc
+    } else if (k.t + 60000 >= S.revPend.deadline) {            // la cloture 5m visee vient de tomber
+      if (wantDir === S.revPend.dir && qEff >= 75) {
+        let n = 0;
+        for (const t of S.trades.filter(t => t.dir !== wantDir && t.pnl < 0)) { closePosition(t, S.price, `🔄 Retournement CONFIRME 5m Q:${qEff}`); n++; }
+        jlog('sell', `🔄 Retournement ${wantDir} CONFIRME a la cloture 5m (flash Q:${S.revPend.q} → Q:${qEff}) — ${n} position(s) coupee(s)`);
+        S.revPend = null;
+        return recordDiag(k, sig, dx, 'RETOURNEMENT_CONFIRME');
+      }
+      jlog('info', `🛡 Retournement ${S.revPend.dir} ANNULE a la cloture 5m — fouet evite (flash Q:${S.revPend.q}, signal retombe)`);
+      S.revPend = null;
+    }
+  }
+
   // 🖐 ENTREE FORCEE MANUELLE (bouton) — prioritaire sur la relance auto
   if (S.forceReq) {
     if (Date.now() - S.forceReq > 180000) {
@@ -728,11 +742,13 @@ function onCandleClose(k) {
   const gapLeft = MIN_GAP_MS - (Date.now() - S.lastEntry);
   if (gapLeft > 0) { jlog('info', `⏳ Signal ${via} ${wantDir} Q:${qEff} ignore — MIN_GAP 1min30 (reste ${Math.ceil(gapLeft/1000)}s)`); return recordDiag(k, sig, dx, 'MIN_GAP'); }
 
-  // Jamais d'ouverture opposee (retournement Q>=75 : coupe les perdants opposes)
+  // Jamais d'ouverture opposee — retournement Q>=75 : coupe APRES confirmation 5m (decret 11/07)
   const hasOpposite = S.trades.some(t => t.dir !== wantDir);
   if (hasOpposite) {
-    if (qEff >= 75) {
-      for (const t of S.trades.filter(t => t.dir !== wantDir && t.pnl < 0)) closePosition(t, S.price, `🔄 Retournement Q:${qEff}`);
+    if (qEff >= 75 && !S.revPend) {
+      const dl = Math.floor((k.t + 60000) / 300000) * 300000 + 300000;
+      S.revPend = { dir: wantDir, q: qEff, deadline: dl };
+      jlog('info', `⏳ Retournement ${wantDir} Q:${qEff} detecte — coupe suspendue, confirmation exigee a la cloture 5m de ${new Date(dl).toISOString().slice(11, 16)} UTC (decret 11/07)`);
     }
     return recordDiag(k, sig, dx, 'POSITION_OPPOSEE');
   }
@@ -805,17 +821,17 @@ async function openPosition(dir, price, lev, q, via, mode) {
     S.trades.push(t); S.lastEntry = Date.now();
     jlog('buy', `🔴 LIVE ${dir} x${lev} @ ~${price.toFixed(PX_DEC)} | $${stake} | via=${via} | #${order.orderId}${order.recovered ? ' (recovered)' : ''}`);
 
-    // SL natif — STOP_MARKET par trade
-    const slO = await placeConditional(E_BASE, {
-      symbol: SYMBOL, side: closeSide, type: 'STOP_MARKET',
-      stopPrice: sl.toFixed(PX_DEC), quantity: qtyStr, reduceOnly: 'true'
-    }, E_KEY, E_SECRET);
+    // v8.2 : SL natif + sortie native poses EN PARALLELE (protection complete ~2x plus vite)
+    const [slO, tpO] = await Promise.all([
+      placeConditional(E_BASE, {
+        symbol: SYMBOL, side: closeSide, type: 'STOP_MARKET',
+        stopPrice: sl.toFixed(PX_DEC), quantity: qtyStr, reduceOnly: 'true'
+      }, E_KEY, E_SECRET),
+      placeConditional(E_BASE, { symbol: SYMBOL, side: closeSide, type: 'TRAILING_STOP_MARKET',
+        activationPrice: tp.toFixed(PX_DEC), callbackRate: CB.toFixed(1),
+        quantity: qtyStr, reduceOnly: 'true' }, E_KEY, E_SECRET)
+    ]);
     if (slO && slO.orderId) { t.bnIds.sl = slO.orderId; t.bnIds.slAlgo = !!slO.algo; }
-
-    // Sortie native selon le mode
-    const tpO = await placeConditional(E_BASE, { symbol: SYMBOL, side: closeSide, type: 'TRAILING_STOP_MARKET',
-          activationPrice: tp.toFixed(PX_DEC), callbackRate: CB.toFixed(1),
-          quantity: qtyStr, reduceOnly: 'true' }, E_KEY, E_SECRET);
     if (tpO && tpO.orderId) { t.bnIds.tp = tpO.orderId; t.bnIds.tpAlgo = !!tpO.algo; }
 
     const exitLbl = `TRAILING natif (arm ${tp.toFixed(PX_DEC)}, cb ${CB}%)`;
@@ -835,13 +851,11 @@ async function openPosition(dir, price, lev, q, via, mode) {
 
 async function cancelTradeStops(t) {
   if (!t.bnIds) return;
-  for (const c of [{ id: t.bnIds.sl, algo: t.bnIds.slAlgo }, { id: t.bnIds.tp, algo: t.bnIds.tpAlgo }]) {
-    if (!c.id) continue;
-    try {
-      await bnCall(E_BASE, c.algo ? '/fapi/v1/algoOrder' : '/fapi/v1/order', 'DELETE',
-        c.algo ? { algoId: c.id } : { symbol: SYMBOL, orderId: c.id }, E_KEY, E_SECRET);
-    } catch (_) { /* deja execute/annule */ }
-  }
+  // v8.2 : annulations en parallele — la fermeture MARKET part plus tot
+  await Promise.all([{ id: t.bnIds.sl, algo: t.bnIds.slAlgo }, { id: t.bnIds.tp, algo: t.bnIds.tpAlgo }]
+    .filter(c => c.id)
+    .map(c => bnCall(E_BASE, c.algo ? '/fapi/v1/algoOrder' : '/fapi/v1/order', 'DELETE',
+      c.algo ? { algoId: c.id } : { symbol: SYMBOL, orderId: c.id }, E_KEY, E_SECRET).catch(() => {})));
 }
 
 // mirror=true → envoie la fermeture MARKET chez Binance ; false → deja fermee cote exchange
@@ -1024,6 +1038,22 @@ async function pollLoop() {
   pollBusy = false;
 }
 
+// ── v8.2 TURBO : ordonnanceur aligne sur l'horloge des clotures 1m ──
+// Croisiere 4s (affichage prix) ; a l'approche d'une cloture 1m, le poll est
+// programme a cloture+400ms ; si Binance publie en retard, re-poll a 700ms
+// (plafonne : retour a 4s au-dela de 10s de retard). Memes bougies, memes
+// decisions — seulement detectees ~1.5s plus tot en moyenne.
+function schedulePoll() {
+  const now = Date.now();
+  let delay = 4000;
+  if (S.lastClosed1m) {
+    const nextClose = S.lastClosed1m + 120000;          // fin de la bougie 1m suivante
+    if (now >= nextClose + 400) delay = (now - nextClose > 10000) ? 4000 : 700;
+    else delay = Math.max(400, Math.min(4000, nextClose + 400 - now));
+  }
+  setTimeout(async () => { try { await pollLoop(); } catch (_) {} schedulePoll(); }, delay);
+}
+
 // ═════════════ SSE — le dashboard est un SPECTATEUR pur ═════════════
 const sseClients = new Set();
 setInterval(() => { for (const r of sseClients) { try { r.write(': ping\n\n'); } catch (_) {} } }, 15000);
@@ -1042,16 +1072,17 @@ function sseState(force) {
     S.lastMult = m9;
   }
   const realClosed = S.closed.filter(t => t.via !== 'ADOPTE');   // ADOPTE = compta fantome, exclue des stats
+  const pnlOpen = S.trades.reduce((a, t) => a + (t.pnl || 0), 0);
+  const pnlClosed = realClosed.reduce((a, t) => a + t.pnl, 0);
+  const pnlTot = pnlClosed + pnlOpen;
+  if (pnlTot < S.pnlLow) S.pnlLow = pnlTot;
+  if (!force && sseClients.size === 0) return;   // v8.2 : personne ne regarde → etat suivi, payload epargne
   const wins = realClosed.filter(t => t.pnl > 0).length;
   const viaStats = {};
   for (const t of S.closed) {
     if (!viaStats[t.via]) viaStats[t.via] = { n: 0, w: 0, pnl: 0 };
     viaStats[t.via].n++; if (t.pnl > 0) viaStats[t.via].w++; viaStats[t.via].pnl += t.pnl;
   }
-  const pnlOpen = S.trades.reduce((a, t) => a + (t.pnl || 0), 0);
-  const pnlClosed = realClosed.reduce((a, t) => a + t.pnl, 0);
-  const pnlTot = pnlClosed + pnlOpen;
-  if (pnlTot < S.pnlLow) S.pnlLow = pnlTot;
   const s9 = {
     mode: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, killed: S.killed,
     armed: !!(E_KEY && E_SECRET), paused: S.paused,
@@ -1179,7 +1210,7 @@ app.get('/api/state', (req, res) => { sseState(true); res.status(200).json({ ok:
 // ═════════════ DASHBOARD INTEGRE (spectateur pur — AUCUNE cle, AUCUNE logique) ═════════════
 const DASH_HTML = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Itachi v8.0 SWING — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
+<title>Itachi v8.2 TURBO — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
 <style>
 :root{--bg:#05070d;--panel:#0a0e17;--surface:#0e1420;--border:#1a2333;--text:#e6edf3;--muted:#7d8ba1;--muted2:#4a5568;--teal:#37e0b0;--blue:#7b87ff;--gold:#d9a441;--red:#ff3b5c;--yellow:#ffc94d}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1244,7 +1275,7 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
 @media(max-width:900px){.app{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--border)}}
 </style></head><body>
 <div class="topbar">
-  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v8.0 SWING · Srv 4.0 · WR: à mesurer</span></span>
+  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v8.2 TURBO · Srv 4.0 · WR: à mesurer</span></span>
   <span class="tright">
     <span class="src"><i>●</i> Prix Binance live</span>
     <span class="badge" id="bMode">—</span>
@@ -1515,14 +1546,14 @@ app.get('/', (req, res) => {
   res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(DASH_HTML);
 });
-app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v8.0-swing', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
+app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v8.2-turbo', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
 
 // ═════════════ DEMARRAGE MOTEUR ═════════════
 async function startEngine() {
   if (ENGINE_MODE === 'off') { console.log('[BOT] ENGINE_MODE=off — serveur en mode PROXY PUR (comportement v3.5). Regler ENGINE_MODE=paper|live + cles pour activer.'); return; }
   if (ENGINE_MODE === 'live' && (!E_KEY || !E_SECRET)) { console.log('[BOT] ⛔ ENGINE_MODE=live mais BINANCE_API_KEY/SECRET absentes — moteur NON demarre.'); return; }
   try {
-    jlog('sys', `🚀 Itachi v8 SWING · Srv 4.0 · WR: a mesurer — ${ENGINE_MODE.toUpperCase()} ${ENGINE_NET.toUpperCase()} ${SYMBOL} — entrees MULTI-REGIME ADX 5m (Q35 range, MIN_GAP 1min30, max 2 pos) · MISE 750$ dyn ±5%/100$ · leviers 12/17/23 par Q · sorties natives UNIFIEES: SL -30% mise, trailing arme +60% → plancher ~+40%, garde-temps 4h · RELANCE 30min 750$ · KILL ${KILL_MODE === 'on' ? 'suiveur HWM-' + (P.CAP*P.KILL).toFixed(0) + '$' : 'OFF (decret — SL seuls gardiens)'}`);
+    jlog('sys', `🚀 Itachi v8.2 TURBO · Srv 4.0 · WR: a mesurer — poll aligne clotures 1m · SL+trail paralleles · keep-warm hote ordres · retournement Q>=75 confirme cloture 5m (decret 11/07) · ${ENGINE_MODE.toUpperCase()} ${ENGINE_NET.toUpperCase()} ${SYMBOL} — entrees MULTI-REGIME ADX 5m (Q35 range, MIN_GAP 1min30, max 2 pos) · MISE 750$ dyn ±5%/100$ · leviers 12/17/23 par Q · sorties natives UNIFIEES: SL -30% mise, trailing arme +60% → plancher ~+40%, garde-temps 4h · RELANCE 30min 750$ · KILL ${KILL_MODE === 'on' ? 'suiveur HWM-' + (P.CAP*P.KILL).toFixed(0) + '$' : 'OFF (decret — SL seuls gardiens)'}`);
     await seedCandles();
     if (ENGINE_MODE === 'live') {
       const bal = await bnCall(E_BASE, '/fapi/v2/balance', 'GET', {}, E_KEY, E_SECRET);
@@ -1537,12 +1568,12 @@ async function startEngine() {
     S.lastEntry = Date.now();   // arme l'horloge du MODE RELANCE a partir du demarrage
     if (!startEngine._timers) { // les boucles ne se creent qu'UNE fois (re-armement sans doublons)
       startEngine._timers = true;
-      setInterval(pollLoop, 4000);
+      schedulePoll();                     // poll aligne sur les clotures 1m (v8.2)
       setInterval(reconcile, 9000);         // inerte hors mode live
       setInterval(refreshNetReel, 30000);   // idem
     }
     if (ENGINE_MODE === 'live') refreshNetReel();
-    jlog('sys', '🔁 Boucle prix 4s active — decisions sur clotures 1m officielles | Binance = source de verite (9s)');
+    jlog('sys', '🔁 Boucle prix ALIGNEE clotures 1m (croisiere 4s, capture ~0.5s) | Binance = source de verite (9s)');
   } catch (e) {
     jlog('sell', `⛔ Demarrage moteur echoue: ${e.message} — nouvel essai dans 30s`);
     setTimeout(startEngine, 30000);
