@@ -237,7 +237,7 @@ app.post('/api/pnl-reel', async (req, res) => {
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v8.2.1-turbo', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v8.3-mrlev', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -769,7 +769,9 @@ function onCandleClose(k) {
 
   recordDiag(k, sig, dx, 'ENTREE_' + via);
   if (via === 'FORCE-manuel') S.forceReq = 0;   // demande consommee
-  openPosition(wantDir, close, mode === 'FORCE' ? FORCE_LEV : getLev(qEff), qEff, via, mode);
+  // Decret 11/07 : en RANGE-MR le levier est plafonne a 12x — la reversion a besoin
+  // d'un stop large (2.5% prix) et paie le notionnel minimal en frais.
+  openPosition(wantDir, close, mode === 'FORCE' ? FORCE_LEV : mode === 'RANGE' ? P.LEV_LOW : getLev(qEff), qEff, via, mode);
 }
 
 // ═════════════ EXECUTION ═════════════
@@ -1216,7 +1218,7 @@ app.get('/api/state', (req, res) => { sseState(true); res.status(200).json({ ok:
 // ═════════════ DASHBOARD INTEGRE (spectateur pur — AUCUNE cle, AUCUNE logique) ═════════════
 const DASH_HTML = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Itachi v8.2.1 TURBO — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
+<title>Itachi v8.3 MRLEV — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
 <style>
 :root{--bg:#05070d;--panel:#0a0e17;--surface:#0e1420;--border:#1a2333;--text:#e6edf3;--muted:#7d8ba1;--muted2:#4a5568;--teal:#37e0b0;--blue:#7b87ff;--gold:#d9a441;--red:#ff3b5c;--yellow:#ffc94d}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1281,7 +1283,7 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
 @media(max-width:900px){.app{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--border)}}
 </style></head><body>
 <div class="topbar">
-  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v8.2.1 TURBO · Srv 4.0 · WR: à mesurer</span></span>
+  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v8.3 MRLEV · Srv 4.0 · WR: à mesurer</span></span>
   <span class="tright">
     <span class="src"><i>●</i> Prix Binance live</span>
     <span class="badge" id="bMode">—</span>
@@ -1437,8 +1439,8 @@ function render(s){
   var rc={RANGE:'var(--yellow)',UP:'var(--teal)',DOWN:'var(--red)',WARMUP:'var(--muted)'};
   $('regTxt').textContent=(rl[s.regime]||s.regime)+(s.adx?' · ADX '+s.adx.toFixed(0):'');
   $('regTxt').style.color=rc[s.regime]||'var(--muted)';
-  var lev=q<45?3:q<70?7:12;
-  $('levNext').innerHTML='Levier prochain : <b style="color:'+(lev===3?'var(--teal)':lev===7?'var(--yellow)':'var(--red)')+'">'+lev+'×</b>';
+  var lev=s.regime==='RANGE'?12:(q<45?12:q<70?17:23);
+  $('levNext').innerHTML='Levier prochain : <b style="color:'+(lev===12?'var(--teal)':lev===17?'var(--yellow)':'var(--red)')+'">'+lev+'×</b>'+(s.regime==='RANGE'?' <span style="color:var(--muted)">(plafond RANGE)</span>':'');
   $('sCap').textContent='$'+fp(s.Pp?s.Pp.cap:0,2);
   $('sTot').textContent=money(s.pnlClosed);$('sTot').className='v '+((s.pnlClosed||0)>=0?'teal':'red');
   $('sOpen').textContent=money(s.pnlOpen);$('sOpen').className='v '+((s.pnlOpen||0)>=0?'teal':'red');
@@ -1552,14 +1554,14 @@ app.get('/', (req, res) => {
   res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(DASH_HTML);
 });
-app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v8.2.1-turbo', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
+app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v8.3-mrlev', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
 
 // ═════════════ DEMARRAGE MOTEUR ═════════════
 async function startEngine() {
   if (ENGINE_MODE === 'off') { console.log('[BOT] ENGINE_MODE=off — serveur en mode PROXY PUR (comportement v3.5). Regler ENGINE_MODE=paper|live + cles pour activer.'); return; }
   if (ENGINE_MODE === 'live' && (!E_KEY || !E_SECRET)) { console.log('[BOT] ⛔ ENGINE_MODE=live mais BINANCE_API_KEY/SECRET absentes — moteur NON demarre.'); return; }
   try {
-    jlog('sys', `🚀 Itachi v8.2.1 TURBO · Srv 4.0 · WR: a mesurer — horloge blindee anti-1102 · poll aligne clotures 1m · SL+trail paralleles · keep-warm hote ordres · retournement Q>=75 confirme cloture 5m (decret 11/07) · ${ENGINE_MODE.toUpperCase()} ${ENGINE_NET.toUpperCase()} ${SYMBOL} — entrees MULTI-REGIME ADX 5m (Q35 range, MIN_GAP 1min30, max 2 pos) · MISE 750$ dyn ±5%/100$ · leviers 12/17/23 par Q · sorties natives UNIFIEES: SL -30% mise, trailing arme +60% → plancher ~+40%, garde-temps 4h · RELANCE 30min 750$ · KILL ${KILL_MODE === 'on' ? 'suiveur HWM-' + (P.CAP*P.KILL).toFixed(0) + '$' : 'OFF (decret — SL seuls gardiens)'}`);
+    jlog('sys', `🚀 Itachi v8.3 MRLEV · Srv 4.0 · WR: a mesurer — RANGE-MR levier plafonne 12x (decret 11/07) · horloge blindee anti-1102 · poll aligne clotures 1m · SL+trail paralleles · keep-warm hote ordres · retournement Q>=75 confirme cloture 5m (decret 11/07) · ${ENGINE_MODE.toUpperCase()} ${ENGINE_NET.toUpperCase()} ${SYMBOL} — entrees MULTI-REGIME ADX 5m (Q35 range, MIN_GAP 1min30, max 2 pos) · MISE 750$ dyn ±5%/100$ · leviers 12/17/23 par Q · sorties natives UNIFIEES: SL -30% mise, trailing arme +60% → plancher ~+40%, garde-temps 4h · RELANCE 30min 750$ · KILL ${KILL_MODE === 'on' ? 'suiveur HWM-' + (P.CAP*P.KILL).toFixed(0) + '$' : 'OFF (decret — SL seuls gardiens)'}`);
     await seedCandles();
     if (ENGINE_MODE === 'live') {
       const bal = await bnCall(E_BASE, '/fapi/v2/balance', 'GET', {}, E_KEY, E_SECRET);
@@ -1643,5 +1645,4 @@ if (process.argv.includes('--selftest')) {
 
 // ══ ECOUTE (apres definition de TOUTES les routes) ══
 if (!process.argv.includes('--selftest')) {
-  app.listen(PORT, () => console.log(`Itachi BOT-BTC v6.0 (Srv 4.0 — proxy + moteur ${ENGINE_MODE.toUpperCase()}) en ecoute sur le port ${PORT}`));
-}
+  app.listen(PORT, () => console.log(`Itachi BOT-BTC v6.0 (Srv 4.0 — proxy + moteur ${ENGINE_MODE.toUpperCase()}) en ecoute sur le port ${
