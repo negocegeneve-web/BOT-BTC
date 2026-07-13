@@ -1647,44 +1647,4 @@ if (process.argv.includes('--selftest')) {
     // ADX : tendance haussiere monotone → +DI > -DI et ADX eleve ; bruit plat → ADX faible
     const trendUp = Array.from({ length: 80 }, (_, i) => ({ h: 100 + i + 0.5, l: 100 + i - 0.5, c: 100 + i }));
     const rUp = calcADX(trendUp, 14);
-    assert(rUp && rUp.pdi > rUp.ndi && rUp.adx > 60, `ADX tendance up : +DI>${rUp ? rUp.ndi.toFixed(1) : '?'} -DI, ADX=${rUp ? rUp.adx.toFixed(1) : '?'} > 60`);
-    const flat = Array.from({ length: 80 }, (_, i) => ({ h: 100 + (i % 2 ? 0.4 : 0.5), l: 100 - (i % 2 ? 0.5 : 0.4), c: 100 + (i % 2 ? -0.1 : 0.1) }));
-    const rFlat = calcADX(flat, 14);
-    assert(rFlat && rFlat.adx < ADX_TREND, `ADX marche plat = ${rFlat ? rFlat.adx.toFixed(1) : '?'} < ${ADX_TREND} → RANGE`);
-    assert(classifyRegime(rUp) === 'UP' && classifyRegime(rFlat) === 'RANGE', 'classifyRegime : UP / RANGE corrects');
-    const trendDn = Array.from({ length: 80 }, (_, i) => ({ h: 200 - i + 0.5, l: 200 - i - 0.5, c: 200 - i }));
-    assert(classifyRegime(calcADX(trendDn, 14)) === 'DOWN', 'classifyRegime : DOWN correct');
-    // QMR : plus l extreme est marque, plus Q monte
-    const bbT = { mid: 100, up: 102, lo: 98, sd: 1 };
-    const qSeuil  = calcQMR('LONG', 98.0, bbT, 32);   // RSI 32 pile sur la bande → doit valoir EXACTEMENT le plancher
-    const qRejet  = calcQMR('LONG', 98.0, bbT, 38);   // RSI 38 sans exces de bande → sous le plancher
-    const qFort   = calcQMR('LONG', 97.0, bbT, 15);   // RSI 15 + 1σ sous la bande → maximal
-    assert(qSeuil === QMR_MIN, `QMR : RSI 32 sur bande = ${qSeuil} = plancher ${QMR_MIN} (decret Q35)`);
-    assert(qRejet < QMR_MIN, `QMR : RSI 38 sans exces = ${qRejet} < ${QMR_MIN} → refuse`);
-    assert(qFort === 99, `QMR extreme = ${qFort}`);
-    // Grille decrets
-    assert(getLev(40) === 12 && getLev(60) === 17 && getLev(85) === 23, 'Leviers 12/17/23 par Q (v8)');
-    assert(getStake(40) === 750 && getStake(85) === 750, 'Mise unique 750$ (v8)');
-    // v8 SWING : distances prix = %mise / levier, callbacks arrondis au pas Binance 0.1
-    assert(Math.abs(SWING_SL_M / 12 - 0.025) < 1e-12, 'SL 12x = -2.5% px');
-    assert(cbRate(12) === 1.7 && cbRate(17) === 1.2 && cbRate(23) === 0.9, `Callbacks: ${cbRate(12)}/${cbRate(17)}/${cbRate(23)}`);
-    const floor12 = SWING_ARM_M - (cbRate(12) / 100) * 12;
-    assert(floor12 > 0.39 && floor12 <= 0.40, `Plancher apres armement 12x ≈ +${(floor12*100).toFixed(1)}% de mise`);
-    assert(FORCE_STAKE === 750, 'Relance alignee 750$ (v8)');
-    // DECRET 07/07 : mises dynamiques ±5%/100$ bornees [0.30;2.00]
-    assert(sizeMultFor(0) === 1 && sizeMultFor(99) === 1 && sizeMultFor(150) === 1.05, `Paliers hausse: ${sizeMultFor(150)}`);
-    assert(sizeMultFor(-99) === 1 && sizeMultFor(-150) === 0.95, `Paliers baisse: ${sizeMultFor(-150)}`);
-    assert(sizeMultFor(999) === 1.45 && sizeMultFor(100000) === 2 && sizeMultFor(-100000) === 0.3, 'Bornes [0.30;2.00]');
-    // DECRET 07/07 : kill suiveur — HWM 100 → plancher -300 ; HWM 500 → +100
-    assert(100 - 2000*0.20 === -300 && 500 - 2000*0.20 === 100, 'Kill suiveur: HWM-400');
-    console.log(ok ? '\n════ SELFTEST COMPLET : TOUT PASSE ════' : '\n════ SELFTEST : ECHECS DETECTES ════');
-    process.exit(ok ? 0 : 1);
-  })();
-} else {
-  startEngine();
-}
-
-// ══ ECOUTE (apres definition de TOUTES les routes) ══
-if (!process.argv.includes('--selftest')) {
-  app.listen(PORT, () => console.log(`Itachi BOT-BTC v6.0 (Srv 4.0 — proxy + moteur ${ENGINE_MODE.toUpperCase()}) en ecoute sur le port ${PORT}`));
-}
+    assert(rUp && rUp.pdi > rUp.ndi && rU
