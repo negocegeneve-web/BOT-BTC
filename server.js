@@ -237,7 +237,7 @@ app.post('/api/pnl-reel', async (req, res) => {
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v8.4-purge', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v8.4.1-keys', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -1164,7 +1164,13 @@ app.post('/api/engine/start', async (req, res) => {
     if (!key || !secret || String(key).length < 10 || String(secret).length < 10)
       return res.status(400).json({ ok: false, error: 'cles manquantes ou invalides' });
     if (S.running) return res.status(409).json({ ok: false, error: 'moteur deja en marche — arrete-le d abord' });
-    E_KEY = String(key).trim(); E_SECRET = String(secret).trim();
+    // v8.4.1 : nettoyage agressif (espaces internes, retours ligne, caracteres invisibles) + diagnostic anti -2014
+    const cleanKey = v => String(v).replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, '');
+    E_KEY = cleanKey(key); E_SECRET = cleanKey(secret);
+    const bad = [];
+    if (!/^[A-Za-z0-9]{64}$/.test(E_KEY))    bad.push(`cle API: ${E_KEY.length} caracteres${/[^A-Za-z0-9]/.test(E_KEY) ? ', dont un caractere INVALIDE (masquage * ou \u2026 colle ?)' : ''} — attendu 64 alphanumeriques`);
+    if (!/^[A-Za-z0-9]{64}$/.test(E_SECRET)) bad.push(`secret: ${E_SECRET.length} caracteres${/[^A-Za-z0-9]/.test(E_SECRET) ? ', dont un caractere INVALIDE' : ''} — attendu 64`);
+    if (bad.length) jlog('sell', `⚠ Format des cles suspect: ${bad.join(' | ')}. Utilise le bouton COPIER de Binance (icone), jamais la selection du texte masque.`);
     ENGINE_MODE = 'live';
     jlog('sys', '🔐 Cles recues depuis la page — RAM uniquement, jamais ecrites. Armement LIVE...');
     await startEngine();
@@ -1224,7 +1230,7 @@ app.get('/api/state', (req, res) => { sseState(true); res.status(200).json({ ok:
 // ═════════════ DASHBOARD INTEGRE (spectateur pur — AUCUNE cle, AUCUNE logique) ═════════════
 const DASH_HTML = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Itachi v8.4 PURGE — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
+<title>Itachi v8.4.1 KEYS — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
 <style>
 :root{--bg:#05070d;--panel:#0a0e17;--surface:#0e1420;--border:#1a2333;--text:#e6edf3;--muted:#7d8ba1;--muted2:#4a5568;--teal:#37e0b0;--blue:#7b87ff;--gold:#d9a441;--red:#ff3b5c;--yellow:#ffc94d}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1289,7 +1295,7 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
 @media(max-width:900px){.app{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--border)}}
 </style></head><body>
 <div class="topbar">
-  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v8.4 PURGE · Srv 4.0 · WR: à mesurer</span></span>
+  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v8.4.1 KEYS · Srv 4.0 · WR: à mesurer</span></span>
   <span class="tright">
     <span class="src"><i>●</i> Prix Binance live</span>
     <span class="badge" id="bMode">—</span>
@@ -1560,7 +1566,7 @@ app.get('/', (req, res) => {
   res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(DASH_HTML);
 });
-app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v8.4-purge', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
+app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v8.4.1-keys', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
 
 // ═════════════ DEMARRAGE MOTEUR ═════════════
 async function startEngine() {
