@@ -1640,4 +1640,16 @@ if (process.argv.includes('--selftest')) {
     assert(sizeMultFor(0) === 1 && sizeMultFor(99) === 1 && sizeMultFor(150) === 1.05, `Paliers hausse: ${sizeMultFor(150)}`);
     assert(sizeMultFor(-99) === 1 && sizeMultFor(-150) === 0.95, `Paliers baisse: ${sizeMultFor(-150)}`);
     assert(sizeMultFor(999) === 1.45 && sizeMultFor(100000) === 2 && sizeMultFor(-100000) === 0.3, 'Bornes [0.30;2.00]');
-    // DECRET 07/07 : kill suiveur — HWM 100 → plancher -300 ; HWM 500
+    // DECRET 07/07 : kill suiveur — HWM 100 → plancher -300 ; HWM 500 → +100
+    assert(100 - 2000*0.20 === -300 && 500 - 2000*0.20 === 100, 'Kill suiveur: HWM-400');
+    console.log(ok ? '\n════ SELFTEST COMPLET : TOUT PASSE ════' : '\n════ SELFTEST : ECHECS DETECTES ════');
+    process.exit(ok ? 0 : 1);
+  })();
+} else {
+  startEngine();
+}
+
+// ══ ECOUTE (apres definition de TOUTES les routes) ══
+if (!process.argv.includes('--selftest')) {
+  app.listen(PORT, () => console.log(`Itachi BOT-BTC v6.0 (Srv 4.0 — proxy + moteur ${ENGINE_MODE.toUpperCase()}) en ecoute sur le port ${PORT}`));
+}
