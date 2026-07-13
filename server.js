@@ -237,7 +237,7 @@ app.post('/api/pnl-reel', async (req, res) => {
 app.get('/api/diag', async (req, res) => {
   const mode = (req.query.mode === 'testnet') ? 'testnet' : 'mainnet';   // défaut MAINNET
   const base = BN_BASES[mode];
-  const out = { version: 'v8.4.1-keys', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
+  const out = { version: 'v8.5-belock', date: new Date().toISOString(), mode_teste: mode, base_testee: base, clockOffsetMs: Math.round(TIME_OFFSET) };
 
   // ── Lecture IP de sortie : ipify d'abord (fiable), replis ensuite ──
   try {
@@ -429,6 +429,7 @@ const FORCE_STAKE = 750;           // v8 : relance/manuel alignes sur la mise un
 const SWING_SL_M  = 0.30;   // SL = -30% de la mise
 const SWING_ARM_M = 0.60;   // armement du trailing = +60% de la mise
 const SWING_CB_M  = 0.20;   // callback = 20 points de mise sous le pic → plancher ~+40%
+const BE_ARM_M    = 0.30;   // decret 13/07 : a +30% de mise, SL natif remonte a break-even+frais
 const TIME_STOP_MS = 4 * 3600 * 1000;   // garde-temps 4h (decret) puis retour au cycle
 const KILL_MODE = (process.env.KILL_MODE || 'off').toLowerCase();   // decret : kill OFF — SL seuls gardiens (KILL_MODE=on pour reactiver)
 function cbRate(lev) { return Math.min(10, Math.max(0.1, Math.round((SWING_CB_M / lev) * 1000) / 10)); } // callbackRate Binance (%, pas 0.1)
@@ -870,6 +871,33 @@ async function cancelTradeStops(t) {
       c.algo ? { algoId: c.id } : { symbol: SYMBOL, orderId: c.id }, E_KEY, E_SECRET).catch(() => {})));
 }
 
+// ── DECRET 13/07 : verrou break-even — a +BE_ARM_M de mise, le SL natif remonte a l'entree+frais.
+// Le trade ne peut plus perdre ; le trailing (+60% → plancher +40%) reste seul juge du haut.
+let beBusy = false;
+async function manageBreakEven() {
+  if (ENGINE_MODE !== 'live' || !S.running || !S.price || beBusy) return;
+  beBusy = true;
+  try {
+    for (const t of S.trades) {
+      if (t.beLocked || !t.bnIds) continue;
+      const fav = t.dir === 'LONG' ? (S.price - t.entry) / t.entry : (t.entry - S.price) / t.entry;
+      if (fav < BE_ARM_M / t.lev) continue;
+      t.beLocked = true;
+      const bePx = t.dir === 'LONG' ? t.entry * 1.001 : t.entry * 0.999;   // entree + ~frais
+      const closeSide = t.dir === 'LONG' ? 'SELL' : 'BUY';
+      const nu = await placeConditional(E_BASE, { symbol: SYMBOL, side: closeSide, type: 'STOP_MARKET',
+        stopPrice: bePx.toFixed(PX_DEC), quantity: t.qty.toFixed(QTY_DEC), reduceOnly: 'true' }, E_KEY, E_SECRET);
+      if (nu && nu.orderId) {
+        const old = { id: t.bnIds.sl, algo: t.bnIds.slAlgo };
+        t.bnIds.sl = nu.orderId; t.bnIds.slAlgo = !!nu.algo; t.sl = bePx;
+        if (old.id) await bnCall(E_BASE, old.algo ? '/fapi/v1/algoOrder' : '/fapi/v1/order', 'DELETE',
+          old.algo ? { algoId: old.id } : { symbol: SYMBOL, orderId: old.id }, E_KEY, E_SECRET).catch(() => {});
+        jlog('buy', `🔒 Break-even verrouille ${t.dir} @ ${bePx.toFixed(PX_DEC)} (+${Math.round(BE_ARM_M * 100)}% de mise atteint) — ce trade ne peut plus perdre`);
+      } else { t.beLocked = false; }
+    }
+  } catch (_) { /* re-tentera au prochain poll */ } finally { beBusy = false; }
+}
+
 // mirror=true → envoie la fermeture MARKET chez Binance ; false → deja fermee cote exchange
 async function closePosition(t, price, reason, mirror = true) {
   const raw = t.dir === 'LONG' ? (price - t.entry) / t.entry * t.stake * t.lev
@@ -1022,6 +1050,7 @@ async function pollLoop() {
       }
     }
     paperManage();
+    manageBreakEven().catch(() => {});   // v8.5 : verrou BE evalue a chaque poll (~1-4s)
     // Suivi PnL live affichage (les sorties LIVE sont executees par Binance)
     if (ENGINE_MODE === 'live') {
       for (const t of [...S.trades]) {
@@ -1230,7 +1259,7 @@ app.get('/api/state', (req, res) => { sseState(true); res.status(200).json({ ok:
 // ═════════════ DASHBOARD INTEGRE (spectateur pur — AUCUNE cle, AUCUNE logique) ═════════════
 const DASH_HTML = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Itachi v8.4.1 KEYS — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
+<title>Itachi v8.5 BELOCK — Srv 4.0 · WR: à mesurer — CryptoSignal AI</title>
 <style>
 :root{--bg:#05070d;--panel:#0a0e17;--surface:#0e1420;--border:#1a2333;--text:#e6edf3;--muted:#7d8ba1;--muted2:#4a5568;--teal:#37e0b0;--blue:#7b87ff;--gold:#d9a441;--red:#ff3b5c;--yellow:#ffc94d}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1295,7 +1324,7 @@ td{padding:7px 8px;border-bottom:1px solid rgba(26,35,51,.6)}
 @media(max-width:900px){.app{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--border)}}
 </style></head><body>
 <div class="topbar">
-  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v8.4.1 KEYS · Srv 4.0 · WR: à mesurer</span></span>
+  <span class="logo"><span class="pulse"></span>CryptoSignal<b>AI</b> <span class="sub">/ Itachi v8.5 BELOCK · Srv 4.0 · WR: à mesurer</span></span>
   <span class="tright">
     <span class="src"><i>●</i> Prix Binance live</span>
     <span class="badge" id="bMode">—</span>
@@ -1566,14 +1595,14 @@ app.get('/', (req, res) => {
   res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(DASH_HTML);
 });
-app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v8.4.1-keys', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
+app.get('/api/health', (req, res) => res.status(200).json({ ok: true, service: 'Itachi BOT-BTC', version: 'v8.5-belock', armed: !!(E_KEY && E_SECRET), engine: ENGINE_MODE, net: ENGINE_NET, symbol: SYMBOL, running: S.running, clockOffsetMs: Math.round(TIME_OFFSET), endpoints: ['/api/binance', '/api/diag', '/api/pnl-reel', '/api/state', '/api/stream', '/api/why'] }));
 
 // ═════════════ DEMARRAGE MOTEUR ═════════════
 async function startEngine() {
   if (ENGINE_MODE === 'off') { console.log('[BOT] ENGINE_MODE=off — serveur en mode PROXY PUR (comportement v3.5). Regler ENGINE_MODE=paper|live + cles pour activer.'); return; }
   if (ENGINE_MODE === 'live' && (!E_KEY || !E_SECRET)) { console.log('[BOT] ⛔ ENGINE_MODE=live mais BINANCE_API_KEY/SECRET absentes — moteur NON demarre.'); return; }
   try {
-    jlog('sys', `🚀 Itachi v8.4 PURGE · Srv 4.0 · WR: a mesurer — FORCE off par decret (0/4 live) · purge anti-orphelin double verrou · RANGE-MR levier plafonne 12x · horloge blindee anti-1102 · poll aligne clotures 1m · SL+trail paralleles · keep-warm hote ordres · retournement Q>=75 confirme cloture 5m (decret 11/07) · ${ENGINE_MODE.toUpperCase()} ${ENGINE_NET.toUpperCase()} ${SYMBOL} — entrees MULTI-REGIME ADX 5m (Q35 range, MIN_GAP 1min30, max 2 pos) · MISE 750$ dyn ±5%/100$ · leviers 12/17/23 par Q · sorties natives UNIFIEES: SL -30% mise, trailing arme +60% → plancher ~+40%, garde-temps 4h · RELANCE 30min 750$ · KILL ${KILL_MODE === 'on' ? 'suiveur HWM-' + (P.CAP*P.KILL).toFixed(0) + '$' : 'OFF (decret — SL seuls gardiens)'}`);
+    jlog('sys', `🚀 Itachi v8.5 BELOCK · Srv 4.0 · WR: a mesurer — verrou break-even a +30% de mise (decret 13/07) · FORCE off par decret (0/4 live) · purge anti-orphelin double verrou · RANGE-MR levier plafonne 12x · horloge blindee anti-1102 · poll aligne clotures 1m · SL+trail paralleles · keep-warm hote ordres · retournement Q>=75 confirme cloture 5m (decret 11/07) · ${ENGINE_MODE.toUpperCase()} ${ENGINE_NET.toUpperCase()} ${SYMBOL} — entrees MULTI-REGIME ADX 5m (Q35 range, MIN_GAP 1min30, max 2 pos) · MISE 750$ dyn ±5%/100$ · leviers 12/17/23 par Q · sorties natives UNIFIEES: SL -30% mise, trailing arme +60% → plancher ~+40%, garde-temps 4h · RELANCE 30min 750$ · KILL ${KILL_MODE === 'on' ? 'suiveur HWM-' + (P.CAP*P.KILL).toFixed(0) + '$' : 'OFF (decret — SL seuls gardiens)'}`);
     await seedCandles();
     if (ENGINE_MODE === 'live') {
       const bal = await bnCall(E_BASE, '/fapi/v2/balance', 'GET', {}, E_KEY, E_SECRET);
