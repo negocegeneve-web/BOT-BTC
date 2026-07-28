@@ -1,5 +1,56 @@
 /* ============================================================
- *  SERVEUR 3.12e - CHAMPION  (fix FLUX PRIX Binance 2026 — strategie 3.12b INTACTE)
+ *  SERVEUR 3.12h - CHAMPION  (bonus Q70+ / mises x2 / fix double-comptage)
+ *  ------------------------------------------------------------
+ *  Trois decrets Calvin du 28/07 vs 3.12g :
+ *
+ *  1. BONUS ELITISTE : declenchement releve de Q>=50 a Q>=BONUS_MIN_Q (70).
+ *     Moins de tickets, mieux choisis (le WR bonus constate a ~29% ne
+ *     couvrait pas le seuil de rentabilite ~52% du couple SL-5%/trail).
+ *  2. MISES NORMALES x2 : 80-280$ -> 160-560$ (meme moteur, meme WR 70%,
+ *     gains en $ doubles). ATTENTION marge : a 6 positions pleines, le
+ *     besoin peut depasser le capital -> des -2019 en serie = signal de
+ *     renforcer le capital ou de redescendre les mises.
+ *  3. FIX DOUBLE-COMPTAGE : la reconciliation ne comptabilise PLUS un trade
+ *     dont la fermeture logicielle est en cours (pos.closing) — fini le
+ *     doublon 'SL/TP NATIF'+'TRAILING'. La ligne native adopte le MEME
+ *     format que closePos (investi/toFixed -> fini $NaN et % a 16 dec.),
+ *     alimente le compteur bonus (BONUS-SL NATIF) et le drawdown.
+ *
+ *  HISTORIQUE 3.12g (BONUS avec SL -5% natif — decret Calvin 26/07)
+ *  ------------------------------------------------------------
+ *  Nouveau vs 3.12f (UNE seule regle changee, sur le BONUS uniquement) :
+ *
+ *  1. FIN DU BONUS "SANS SL" — constat reel du 26/07 : compte en marge CROSS,
+ *     donc AUCUNE liquidation-plancher par position ; les bonus saignaient
+ *     sans limite (EUL : -18.6% de prix = -106$ pour 38$ de mise, -2.8x).
+ *     Bilan bonus sur l'echantillon : 5 pertes / 1 gain, ~-325$ net.
+ *  2. NOUVELLE REGLE (decret) : SL BONUS -5% PRIX (BONUS_SL_PCT=0.05), pose
+ *     NATIVEMENT sur Binance (STOP_MARKET closePosition) + doublure logicielle
+ *     en secours (raison 'BONUS-SL'). A x15 : perte max ~75% de la mise
+ *     (~19-37$). Le TP bonus reste le trailing logiciel (+100% de mise, rend
+ *     30% du pic) — PAS de TP natif : le gain reste sans plafond.
+ *  3. Moteur principal STRICTEMENT identique (SL -4.5%, trailing, cap 6).
+ *
+ *  HISTORIQUE 3.12f (SL/TP NATIFS Binance via /fapi/v2/order + cap 6 pos)
+ *  ------------------------------------------------------------
+ *  Nouveau vs 3.12e (ZERO strategie touchee — 3.12b INTACTE) :
+ *
+ *  1. STOPS NATIFS REPARES (enseignement v8 valide en reel) : les ordres
+ *     conditionnels STOP_MARKET / TAKE_PROFIT_MARKET passent par
+ *     /fapi/v2/order — champ `type` (jamais orderType), stopPrice,
+ *     closePosition:'true', workingType MARK_PRICE, SANS timeInForce.
+ *     L'essai /fapi/v1/algoOrder (qui echouait en -1102 : champ orderType)
+ *     est abandonne ; repli /fapi/v1/order conserve (vieux testnet).
+ *     Log 🛡️ a chaque pose reussie -> verification visuelle immediate.
+ *  2. ADOPTION PROTEGEE : toute position reelle adoptee par la reconciliation
+ *     (9s) recoit IMMEDIATEMENT son SL -4.5% + TP natifs sur Binance.
+ *     Avant : seule la boucle logicielle la couvrait -> nue si le serveur
+ *     tombait (cause directe des -17.6%/-9.2% du 20/07).
+ *  3. PURGE ANTI-ORPHELINS etendue a /fapi/v2/allOpenOrders (pattern
+ *     trade #10) — non bloquant si l'endpoint est absent.
+ *  4. CAP POSITIONS 25 -> 6 (decret Calvin 20/07/2026).
+ *
+ *  HISTORIQUE 3.12e (fix FLUX PRIX Binance 2026 — strategie 3.12b INTACTE)
  *  ------------------------------------------------------------
  *  CORRECTIF CRITIQUE : migration WebSocket Binance Futures du 06/03/2026
  *  (routes /public /market /private ; legacy retire le 23/04/2026). L'URL
@@ -76,7 +127,7 @@
  *
  * Principes :
  *   - Binance = source de vérité (réconciliation ~9s, vérif après timeout -1007)
- *   - 1 position par symbole (One-Way), jusqu'à 25 positions en parallèle
+ *   - 1 position par symbole (One-Way), jusqu'à 6 positions en parallèle (3.12f)
  *   - Exposition notionnelle bornée par MAX_EXPOSURE_PCT (garde-fou, levier inclus)
  *   - Frais Binance intégrés dans le P&L (maker à l'entrée si possible, taker en sortie)
  *   - Bougies 1h (analyse) + 2h (régime ADX), indicateurs réactifs recalculés au tick
@@ -219,12 +270,12 @@ const STRAT = {
   LEV_MAX: 5,
 
   // --- Mise variable 80-280$ selon la qualite ---
-  STAKE_MIN_USD: 80,
-  STAKE_MAX_USD: 280,
+  STAKE_MIN_USD: 160, // decret Calvin 28/07 : mises normales x2 (etait 80)
+  STAKE_MAX_USD: 560, // decret Calvin 28/07 : mises normales x2 (etait 280)
   Q_FOR_MAX_STAKE: 80,  // Q>=80 -> mise max 280$ ; interpolation lineaire depuis 80$
 
   // --- Positions & risque ---
-  MAX_POSITIONS_CAP: 25, // jusqu'a 25 positions simultanees
+  MAX_POSITIONS_CAP: 6, // decret Calvin 20/07/2026 : 6 positions simultanees MAX (etait 25)
   MAX_EXPOSURE_PCT: 6.0, // exposition relevee a 600% (garde-fou)
 
   // --- ROTATION DE CAPITAL : fermer un mini-perdant essouffle pour un slot EXCELLENT ---
@@ -295,10 +346,12 @@ const STRAT = {
   //     pour marches AGITES uniquement, COMPTEUR SEPARE, bouton dashboard, OFF possible.
   BONUS_ENABLED: true,
   BONUS_INTERVAL_MS: 3600000,   // 1 bonus par heure maximum
+  BONUS_MIN_Q: 70,              // decret Calvin 28/07 : bonus reserve aux signaux d'elite (etait 50)
   BONUS_STAKE_MIN_USD: 25,
   BONUS_STAKE_MAX_USD: 50,
   BONUS_STAKE_PCT: 0.03,        // ~3% du capital, borne 25-50$
   BONUS_LEV: 15,                // x15 (le moins destructeur du range x12-20 au backtest)
+  BONUS_SL_PCT: 0.05,           // decret Calvin 26/07 : SL -5% PRIX sur le bonus (= ~-75% de la mise a x15). Fin du "sans SL" : en marge cross, pas de liquidation-plancher -> perte illimitee constatee.
   BONUS_TP_ARM_STAKE: 1.00,     // le trailing s'arme quand le gain atteint +100% de la mise
   BONUS_TRAIL_GIVEBACK: 0.30,   // apres armement : ferme si le gain rend 30% de son pic (laisse courir)
   FILLER_LEV: 2,              // levier fixe x2 (minimal)
@@ -1264,13 +1317,20 @@ async function tryOpen(symbol, signal) {
   S.lastEntryAt = now;
   if (!state.openTimestamps) state.openTimestamps = [];
   state.openTimestamps.push(now); // compteur du plancher (heure glissante, tous symboles)
-  if (signal.bonus) { S.position.bonus = true; state.lastBonusAt = now; }
+  if (signal.bonus) {
+    S.position.bonus = true; state.lastBonusAt = now;
+    // 3.12g (decret Calvin) : le bonus a desormais un SL -5% PRIX. Fini le "sans SL" :
+    // en marge CROSS il n'y a pas de liquidation-plancher -> perte illimitee constatee.
+    S.position.slPct = STRAT.BONUS_SL_PCT;
+    S.position.sl = signal.side === 'BUY' ? entry * (1 - STRAT.BONUS_SL_PCT) : entry * (1 + STRAT.BONUS_SL_PCT);
+  }
   const f = S.swing.funding != null ? ` funding=${(S.swing.funding*100).toFixed(3)}%` : '';
   const fTag = signal.filler ? ' [comblement]' : '';
   logLine(`🟢 ${symbol} ${signal.side} qty=${qty} @ ${entry.toFixed(4)} x${lev} Q=${signal.quality} via=${signal.via || 'BB'} SL-${(exits.slPct*100).toFixed(1)}%${f} [${entryFill}]${fTag}`);
-  // Poser le SL + TP natifs sur Binance (protection 24/7) — SAUF le bonus loterie,
-  // qui n'a PAS de SL (spec Calvin) : la liquidation Binance est son plancher.
-  if (!signal.bonus) await placeExchangeStops(symbol);
+  // Poser les stops natifs sur Binance (protection 24/7). 3.12g : le BONUS aussi
+  // recoit son SL natif -5% (decret Calvin) — mais PAS de TP natif (son TP est le
+  // trailing logiciel arme a +100% de la mise, sans plafond de gain).
+  await placeExchangeStops(symbol);
   broadcast({ type: 'positions', positions: livePositions() });
 }
 
@@ -1421,48 +1481,56 @@ async function cancelAlgoStops(symbol) {
   } catch (e) { /* endpoint absent (vieux testnet) : non bloquant */ }
   // Filet : purge aussi les ordres classiques éventuels (anciennes versions).
   try { await signedRequest('DELETE', '/fapi/v1/allOpenOrders', { symbol }); } catch (e) {}
+  // Filet 2 (3.12f) : purge les conditionnels poses via /fapi/v2 — anti-orphelins
+  // (pattern trade #10). Non bloquant si l'endpoint n'existe pas dans l'environnement.
+  try { await signedRequest('DELETE', '/fapi/v2/allOpenOrders', { symbol }); } catch (e) {}
 }
 
-// STOP-LOSS / TAKE-PROFIT NATIFS via le NOUVEL endpoint ALGO (/fapi/v1/algoOrder).
-// CORRECTIF -4120 (migration Binance 09/12/2025) : les ordres conditionnels
-// (STOP_MARKET/TAKE_PROFIT_MARKET) sont REJETES sur /fapi/v1/order et doivent passer
-// par le service Algo. Structure : orderType conditionnel + triggerPrice + closePosition.
-// Fallback : si l'endpoint algo echoue (testnet incomplet), pos.exchangeStops reste
-// false -> le SL LOGICIEL (managePosition, tick ~1s) continue de proteger. Jamais nu.
+// STOP-LOSS / TAKE-PROFIT NATIFS via /fapi/v2/order (3.12f — enseignement v8 valide en reel).
+// Migration Binance 09/12/2025 : les conditionnels (STOP_MARKET/TAKE_PROFIT_MARKET)
+// sont REJETES sur /fapi/v1/order (-4120). L'ancien essai /fapi/v1/algoOrder echouait
+// en -1102 (il envoyait `orderType` ; Binance exige le champ `type`). Structure VALIDE :
+// type + stopPrice + closePosition:'true' + workingType:'MARK_PRICE', SANS timeInForce.
+// Repli /fapi/v1/order conserve (vieux testnet pre-migration). Si tout echoue :
+// SL LOGICIEL (managePosition, tick ~1s) en secours. Jamais nu tant que le bot tourne.
 async function placeExchangeStops(symbol) {
   const S = state.sym[symbol];
   const pos = S && S.position;
   if (!pos) return 0;
-  if (pos.bonus) return 0; // le bonus loterie n'a PAS de SL natif (spec : liquidation seule)
+  // 3.12g : le bonus a desormais un SL natif -5% (decret Calvin 26/07). Seul le TP
+  // natif reste exclu pour lui (TP = trailing logiciel +100% de mise, sans plafond).
   const closeSide = pos.side === 'BUY' ? 'SELL' : 'BUY';
   await cancelAlgoStops(symbol); // purge anti-doublon (au trailing, pos.sl a pu bouger)
   const slPrice = roundPrice(symbol, pos.sl);
   const tpPrice = roundPrice(symbol, pos.tp);
-  const placeAlgo = async (orderType, triggerPrice) => {
-    // Essai 1 : nouvel endpoint Algo (post-migration).
+  const placeNative = async (orderType, triggerPrice) => {
+    // Parametres VALIDES post-migration 09/12/2025 (enseignement v8, teste en reel) :
+    // champ `type` (jamais orderType), stopPrice, closePosition, SANS timeInForce.
+    const p = {
+      symbol, side: closeSide, type: orderType, stopPrice: triggerPrice,
+      closePosition: 'true', workingType: 'MARK_PRICE',
+    };
+    // Essai 1 : /fapi/v2/order — endpoint des ordres conditionnels depuis la migration
+    // (le v1 les rejette en -4120, l'algoOrder exigeait un autre schema -> -1102).
     try {
-      await signedRequest('POST', '/fapi/v1/algoOrder', {
-        symbol, side: closeSide, orderType, triggerPrice,
-        closePosition: 'true', workingType: 'MARK_PRICE', timeInForce: 'GTE_GTC',
-      });
+      await signedRequest('POST', '/fapi/v2/order', p);
+      logLine(`\u{1F6E1}\uFE0F ${symbol} ${orderType} NATIF posé sur Binance @ ${triggerPrice} (v2)`);
       return true;
     } catch (e1) {
-      // Essai 2 (repli) : ancien endpoint, pour les environnements pas encore migres.
+      // Essai 2 (repli) : /fapi/v1/order — vieux environnements testnet pre-migration.
       try {
-        await signedRequest('POST', '/fapi/v1/order', {
-          symbol, side: closeSide, type: orderType, stopPrice: triggerPrice,
-          closePosition: 'true', workingType: 'MARK_PRICE', timeInForce: 'GTE_GTC',
-        });
+        await signedRequest('POST', '/fapi/v1/order', p);
+        logLine(`\u{1F6E1}\uFE0F ${symbol} ${orderType} NATIF posé sur Binance @ ${triggerPrice} (v1)`);
         return true;
       } catch (e2) {
-        logLine(`\u26A0\uFE0F ${symbol} ${orderType} natif non posé (algo: ${e1.binanceCode || e1.message} / classique: ${e2.binanceCode || e2.message}) — SL logiciel actif en secours.`);
+        logLine(`\u26A0\uFE0F ${symbol} ${orderType} natif non posé (v2: ${e1.binanceCode || e1.message} / v1: ${e2.binanceCode || e2.message}) — SL logiciel actif en secours.`);
         return false;
       }
     }
   };
   let ok = 0;
-  if (await placeAlgo('STOP_MARKET', slPrice)) ok++;
-  if (await placeAlgo('TAKE_PROFIT_MARKET', tpPrice)) ok++;
+  if (await placeNative('STOP_MARKET', slPrice)) ok++;
+  if (!pos.bonus && await placeNative('TAKE_PROFIT_MARKET', tpPrice)) ok++;
   pos.exchangeStops = ok > 0; // true seulement si au moins le SL est posé côté Binance
   if (ok) pos.exchangeSlPrice = slPrice;
   return ok;
@@ -1481,17 +1549,20 @@ function managePosition(symbol) {
   // Pic de profit (pour le trailing)
   if (pos.peakPnl == null || pnlPct > pos.peakPnl) pos.peakPnl = pnlPct;
 
-  // BONUS LOTERIE (spec Calvin) : AUCUN stop-loss (liquidation = plancher naturel).
-  // Un trailing s'arme quand le gain atteint +100% de la mise, puis laisse courir
-  // (ferme quand le gain rend 30% de son pic). Pas de time-stop : on laisse filer.
+  // BONUS LOTERIE (3.12g, decret Calvin 26/07) : SL -5% PRIX (natif + logiciel en secours).
+  // Le trailing s'arme quand le gain atteint +100% de la mise, puis laisse courir
+  // (ferme quand le gain rend 30% de son pic). Pas de time-stop.
   if (pos.bonus) {
+    // 0) STOP-LOSS -5% : coupe AVANT le trou sans fond du cross-margin
+    //    (constate le 26/07 : EUL -18.6% de prix = -2.8x la mise, sans liquidation).
+    if (pnlPct <= -(pos.slPct || STRAT.BONUS_SL_PCT)) { closePos(symbol, 'BONUS-SL'); return; }
     const stakeGain = pnlPct * pos.lev; // gain en fraction de la mise (prix * levier)
     if (pos.bonusPeakGain == null || stakeGain > pos.bonusPeakGain) pos.bonusPeakGain = stakeGain;
     if (pos.bonusPeakGain >= STRAT.BONUS_TP_ARM_STAKE) {
       pos.bonusArmed = true; // doublement atteint -> trailing actif
       if (stakeGain <= pos.bonusPeakGain * (1 - STRAT.BONUS_TRAIL_GIVEBACK)) { closePos(symbol, 'BONUS-TRAIL'); return; }
     }
-    return; // tant que non armé : on laisse vivre (la liquidation Binance gere le pire cas)
+    return; // au-dessus du SL et non arme : on laisse vivre
   }
 
   // 1) Stop-loss fixe (STRAT.SL_PCT)
@@ -1551,8 +1622,9 @@ async function symbolTick(symbol) {
   S._detectAt = now;
   refreshLiveIndicators(S); // bandes/RSI réactifs au prix courant
   let signal = computeSignal(symbol);
-  // BONUS LOTERIE (spec Calvin) : 1x/heure, sur un signal NORMAL de qualite (Q>=50).
-  if (signal && !signal.filler && STRAT.BONUS_ENABLED && signal.quality >= 50 &&
+  // BONUS LOTERIE (3.12h, decret Calvin) : 1x/heure, reserve aux signaux d'ELITE
+  // (Q >= BONUS_MIN_Q=70, etait 50) — moins de tickets, mieux choisis.
+  if (signal && !signal.filler && STRAT.BONUS_ENABLED && signal.quality >= STRAT.BONUS_MIN_Q &&
       (Date.now() - state.lastBonusAt) >= STRAT.BONUS_INTERVAL_MS) {
     signal = { ...signal, bonus: true };
   }
@@ -1597,6 +1669,9 @@ async function reconcile() {
     for (const symbol of Object.keys(state.sym)) {
       const S = state.sym[symbol];
       if (S.position && S.position.closingManual) continue; // fermeture manuelle en cours
+      // 3.12h : fermeture LOGICIELLE en cours -> closePos comptabilisera lui-meme.
+      // Garde ANTI-DOUBLE-COMPTAGE (doublon 'SL/TP NATIF'+'TRAILING' constate le 26/07).
+      if (S.position && S.position.closing) continue;
       if (S.position && !real[symbol]) {
         // Position fermée cote Binance (par le SL/TP NATIF, un stop manuel Binance, ou
         // une liquidation) alors que le bot ne l'a pas fermee lui-meme -> on COMPTABILISE
@@ -1611,10 +1686,22 @@ async function reconcile() {
         const net = gross - fees;
         state.capital += net;
         state.stats.gross += gross; state.stats.fees += fees; state.stats.net += net;
-        if (net >= 0) state.stats.wins++; else state.stats.losses++;
+        if (net >= 0) { state.stats.wins++; state.consecLosses = 0; } else { state.stats.losses++; state.consecLosses++; }
+        if (pos.bonus) { // 3.12h : les fermetures natives alimentent AUSSI le compteur separe du bonus
+          state.bonusStats.count++; state.bonusStats.net += net;
+          if (net >= 0) state.bonusStats.wins++; else state.bonusStats.losses++;
+        }
+        if (state.capital > state.peakCapital) state.peakCapital = state.capital;
+        const ddNat = (state.peakCapital - state.capital) / state.peakCapital;
+        if (ddNat > state.maxDrawdown) state.maxDrawdown = ddNat;
+        // 3.12h : MEME format de ligne que closePos — fini le $NaN (champ investi
+        // manquant) et le pourcentage brut a 16 decimales dans l'historique.
+        const investiNat = (pos.stake || ((pos.qty * pos.entry) / (pos.lev || 1)) || 0);
         state.trades.unshift({ symbol, side: pos.side, lev: pos.lev, entry: pos.entry,
-          exit: exitPx, stake: pos.stake, pnlPct: pnlPct * 100, gross, fees, net,
-          reason: 'SL/TP NATIF', at: Date.now(), durationMs: Date.now() - (pos.openedAt || Date.now()) });
+          exit: exitPx, quality: pos.quality, investi: investiNat.toFixed(2),
+          pnlPct: (pnlPct * 100).toFixed(2), gross: gross.toFixed(2), fees: fees.toFixed(2),
+          net: net.toFixed(2), reason: pos.bonus ? 'BONUS-SL NATIF' : 'SL/TP NATIF',
+          at: Date.now(), durationMs: Date.now() - (pos.openedAt || Date.now()) });
         if (state.trades.length > 100) state.trades.pop();
         S.position = null;
         logLine(`🛡️ ${symbol} : fermé par ordre natif Binance (SL/TP) — net ${net.toFixed(2)}$ comptabilisé.`);
@@ -1644,6 +1731,9 @@ async function reconcile() {
         // S'assurer que le symbole est surveillé (flux prix) même hors univers courant.
         if (!ALL_SYMBOLS.includes(symbol)) { ALL_SYMBOLS.push(symbol); reconnectPriceStreamsSoon(); }
         logLine(`🩹 ${symbol} : position réelle ADOPTÉE (${r.side} ${r.qty} @ ${r.entry}, x${r.lev}) — désormais gérée.`);
+        // 3.12f : protection IMMEDIATE — le SL -4.5% + TP natifs sont poses sur Binance
+        // des l'adoption (avant, seule la boucle logicielle couvrait la position).
+        try { await placeExchangeStops(symbol); } catch (e) { logLine(`\u26A0\uFE0F ${symbol} stops natifs post-adoption: ${e.message}`); }
       } else {
         // Position connue : on resynchronise qty/entry sur la réalité Binance.
         S.position.qty = r.qty;
@@ -1975,11 +2065,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
   <div class="head">
     <span class="logo">CryptoSignal<span class="c">AI</span> · Multi</span>
-    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.12e - Champion · 40 sym <span style="opacity:.6;font-weight:600">· WR ~70%</span></span>
+    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.12h - Champion · 40 sym <span style="opacity:.6;font-weight:600">· WR ~70%</span></span>
     <span id="mode" class="badge net">TESTNET</span>
     <span id="run" class="badge off">PAUSE</span>
   </div>
-  <div class="sub" id="stratline">3.12e-Champion · connexion dashboard · SL -4.5% (optimisé) · trailing +1%/-1.5% · bonus loterie · multi-régime</div>
+  <div class="sub" id="stratline">3.12h-Champion · bonus Q70+ · mises x2 · SL -4.5% (optimisé) · trailing +1%/-1.5% · bonus loterie · multi-régime</div>
 
   <div class="card" style="margin-bottom:12px">
     <div class="k" style="color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.5px">Connexion Binance</div>
@@ -2076,7 +2166,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     if($('toggleRelax'))$('toggleRelax').textContent='🔧 Assoupli: '+(s.strat&&s.strat.relaxOn?'ON':'OFF');
     if($('toggleFloor'))$('toggleFloor').textContent='🎯 Plancher 4/h: '+(s.strat&&s.strat.floorOn?'ON':'OFF');
     if($('toggleBonus')){var bs=s.bonusStats||{count:0,wins:0,losses:0,net:0};$('toggleBonus').textContent='🎰 Bonus: '+(s.strat&&s.strat.bonusOn?'ON':'OFF')+(bs.count?' ('+bs.wins+'W/'+bs.losses+'L '+(bs.net>=0?'+':'')+bs.net.toFixed(0)+'$)':'');}
-    $('stratline').textContent='3.12e-Champion · SL -'+(s.strat?s.strat.sl.toFixed(1):4.5)+'% (optimisé backtest) · trailing +'+(s.strat?s.strat.trailArm:1)+'%/-'+(s.strat?s.strat.trailPct:1.5)+'% · bonus loterie 25-50$ x15 · laisse courir 24h · multi-régime (RANGE→MR / UP→long / DOWN→short) · x2-5';
+    $('stratline').textContent='3.12h-Champion · SL -'+(s.strat?s.strat.sl.toFixed(1):4.5)+'% (optimisé backtest) · trailing +'+(s.strat?s.strat.trailArm:1)+'%/-'+(s.strat?s.strat.trailPct:1.5)+'% · bonus loterie Q70+ 25-50$ x15 SL-5% · laisse courir 24h · multi-régime (RANGE→MR / UP→long / DOWN→short) · x2-5';
       if($('connInfo')) $('connInfo').textContent = s.connected ? ('🔐 Connecté '+(s.mode||'').toUpperCase()+' — clé '+(s.keyPrefix||'')+'…') : '⚠️ Non connecté — lecture seule (choisis un mode, colle tes clés, 🔐 Connecter)';
     if(s.connected && $('btnConnect') && $('btnConnect').textContent.indexOf('⏳')===0){ $('apiKey').value=''; $('apiSecret').value=''; $('btnConnect').textContent='🔐 Connecter'; selMode=null; }
     paintTabs(s.mode);
@@ -2248,8 +2338,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // DÉMARRAGE
 // ==================================================================
 async function start() {
-  logLine(`\u{1F680} Itachi — SERVEUR 3.12e-Champion (fix flux prix Binance 2026 — strategie 3.12b intacte) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
-  logLine(`\u{1F4C8} 3.12e-Champion — SL -4.5% (optimise) / trailing +1%/-1.5% — bonus loterie 25-50$ x15 sans SL — x2-5 — mise 80-280$ — 25 pos — seuils +15%`);
+  logLine(`\u{1F680} Itachi — SERVEUR 3.12h-Champion (bonus Q70+ / mises x2 / fix double-comptage — decrets Calvin 28/07) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
+  logLine(`\u{1F4C8} 3.12h-Champion — SL -4.5% (optimise) / trailing +1%/-1.5% — bonus loterie Q70+ 25-50$ x15 SL -5% — x2-5 — mise 160-560$ — 6 pos — seuils +15%`);
   if (!API_KEY || !API_SECRET) logLine('\u26A0\uFE0F Aucune cle — choisis TESTNET/MAINNET dans le dashboard, colle tes cles et clique 🔐 Connecter.');
   else logLine(`🔐 Cles trouvees en variables d'environnement — mode ${MODE.toUpperCase()} pre-connecte (reconnexion auto post-redeploiement).`);
 
