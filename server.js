@@ -1,5 +1,18 @@
 /* ============================================================
- *  SERVEUR 3.12i - CHAMPION  (stops natifs algoOrder / bonus x9 / garde marge)
+ *  SERVEUR 3.12j - CHAMPION  (fix course bonus / stops natifs algoOrder / garde marge)
+ *  ------------------------------------------------------------
+ *  Decret Calvin du 30/07 vs 3.12i :
+ *
+ *  1. FIX COURSE BONUS : au demarrage, plusieurs symboles pouvaient ouvrir
+ *     un bonus x9 SIMULTANEMENT — le verrou 1x/heure (state.lastBonusAt)
+ *     n'etait pose qu'a l'ouverture (tryOpen, apres les appels reseau),
+ *     donc tous les symbolTick concurrents passaient le test d'intervalle
+ *     avant la premiere pose. Desormais le verrou est RESERVE des qu'un
+ *     signal bonus est retenu (symbolTick), avant tout await. Consequence
+ *     assumee : bonus retenu mais ouverture echouee = slot horaire
+ *     consomme (anti-course avant tout).
+ *
+ *  HISTORIQUE 3.12i (stops natifs algoOrder / bonus x9 / garde marge)
  *  ------------------------------------------------------------
  *  Quatre decrets Calvin du 30/07 vs 3.12h :
  *
@@ -1376,7 +1389,7 @@ async function tryOpen(symbol, signal) {
   if (!state.openTimestamps) state.openTimestamps = [];
   state.openTimestamps.push(now); // compteur du plancher (heure glissante, tous symboles)
   if (signal.bonus) {
-    S.position.bonus = true; state.lastBonusAt = now;
+    S.position.bonus = true; // 3.12j : lastBonusAt deja reserve a la retenue (symbolTick)
     // 3.12g (decret Calvin) : le bonus a desormais un SL -5% PRIX. Fini le "sans SL" :
     // en marge CROSS il n'y a pas de liquidation-plancher -> perte illimitee constatee.
     S.position.slPct = STRAT.BONUS_SL_PCT;
@@ -1690,6 +1703,9 @@ async function symbolTick(symbol) {
   // (Q >= BONUS_MIN_Q=70, etait 50) — moins de tickets, mieux choisis.
   if (signal && !signal.filler && STRAT.BONUS_ENABLED && signal.quality >= STRAT.BONUS_MIN_Q &&
       (Date.now() - state.lastBonusAt) >= STRAT.BONUS_INTERVAL_MS) {
+    // 3.12j (decret Calvin 30/07) : verrou RESERVE ICI, avant tout await —
+    // pose a l'ouverture, plusieurs symboles passaient le test simultanement.
+    state.lastBonusAt = Date.now();
     signal = { ...signal, bonus: true };
   }
   // PLANCHER : pas de signal normal ET moins de 4 entrées dans l'heure -> tenter un
@@ -2129,11 +2145,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
   <div class="head">
     <span class="logo">CryptoSignal<span class="c">AI</span> · Multi</span>
-    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.12i - Champion · 40 sym <span style="opacity:.6;font-weight:600">· WR ~70%</span></span>
+    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.12j - Champion · 40 sym <span style="opacity:.6;font-weight:600">· WR ~70%</span></span>
     <span id="mode" class="badge net">TESTNET</span>
     <span id="run" class="badge off">PAUSE</span>
   </div>
-  <div class="sub" id="stratline">3.12i-Champion · bonus Q70+ x9 · mises x2 · garde marge · SL -4.5% (optimisé) · trailing +1%/-1.5% · multi-régime</div>
+  <div class="sub" id="stratline">3.12j-Champion · bonus Q70+ x9 · mises x2 · garde marge · SL -4.5% (optimisé) · trailing +1%/-1.5% · multi-régime</div>
 
   <div class="card" style="margin-bottom:12px">
     <div class="k" style="color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.5px">Connexion Binance</div>
@@ -2230,7 +2246,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     if($('toggleRelax'))$('toggleRelax').textContent='🔧 Assoupli: '+(s.strat&&s.strat.relaxOn?'ON':'OFF');
     if($('toggleFloor'))$('toggleFloor').textContent='🎯 Plancher 4/h: '+(s.strat&&s.strat.floorOn?'ON':'OFF');
     if($('toggleBonus')){var bs=s.bonusStats||{count:0,wins:0,losses:0,net:0};$('toggleBonus').textContent='🎰 Bonus: '+(s.strat&&s.strat.bonusOn?'ON':'OFF')+(bs.count?' ('+bs.wins+'W/'+bs.losses+'L '+(bs.net>=0?'+':'')+bs.net.toFixed(0)+'$)':'');}
-    $('stratline').textContent='3.12i-Champion · SL -'+(s.strat?s.strat.sl.toFixed(1):4.5)+'% (optimisé backtest) · trailing +'+(s.strat?s.strat.trailArm:1)+'%/-'+(s.strat?s.strat.trailPct:1.5)+'% · bonus loterie Q70+ 25-50$ x9 SL-5% · garde marge · laisse courir 24h · multi-régime (RANGE→MR / UP→long / DOWN→short) · x2-5';
+    $('stratline').textContent='3.12j-Champion · SL -'+(s.strat?s.strat.sl.toFixed(1):4.5)+'% (optimisé backtest) · trailing +'+(s.strat?s.strat.trailArm:1)+'%/-'+(s.strat?s.strat.trailPct:1.5)+'% · bonus loterie Q70+ 25-50$ x9 SL-5% · garde marge · laisse courir 24h · multi-régime (RANGE→MR / UP→long / DOWN→short) · x2-5';
       if($('connInfo')) $('connInfo').textContent = s.connected ? ('🔐 Connecté '+(s.mode||'').toUpperCase()+' — clé '+(s.keyPrefix||'')+'…') : '⚠️ Non connecté — lecture seule (choisis un mode, colle tes clés, 🔐 Connecter)';
     if(s.connected && $('btnConnect') && $('btnConnect').textContent.indexOf('⏳')===0){ $('apiKey').value=''; $('apiSecret').value=''; $('btnConnect').textContent='🔐 Connecter'; selMode=null; }
     paintTabs(s.mode);
@@ -2402,8 +2418,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // DÉMARRAGE
 // ==================================================================
 async function start() {
-  logLine(`\u{1F680} Itachi — SERVEUR 3.12i-Champion (stops natifs algoOrder / bonus x9 / garde marge — decrets Calvin 30/07) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
-  logLine(`\u{1F4C8} 3.12i-Champion — SL -4.5% (optimise) / trailing +1%/-1.5% — bonus loterie Q70+ 25-50$ x9 SL -5% — garde marge anti-2019 — x2-5 — mise 160-560$ — 6 pos — seuils +15%`);
+  logLine(`\u{1F680} Itachi — SERVEUR 3.12j-Champion (fix course bonus / stops natifs algoOrder / garde marge — decrets Calvin 30/07) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
+  logLine(`\u{1F4C8} 3.12j-Champion — SL -4.5% (optimise) / trailing +1%/-1.5% — bonus loterie Q70+ 25-50$ x9 SL -5% — garde marge anti-2019 — x2-5 — mise 160-560$ — 6 pos — seuils +15%`);
   if (!API_KEY || !API_SECRET) logLine('\u26A0\uFE0F Aucune cle — choisis TESTNET/MAINNET dans le dashboard, colle tes cles et clique 🔐 Connecter.');
   else logLine(`🔐 Cles trouvees en variables d'environnement — mode ${MODE.toUpperCase()} pre-connecte (reconnexion auto post-redeploiement).`);
 
