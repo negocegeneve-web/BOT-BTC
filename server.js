@@ -1,5 +1,28 @@
 /* ============================================================
- *  SERVEUR 3.12j - CHAMPION  (fix course bonus / stops natifs algoOrder / garde marge)
+ *  SERVEUR 3.13a - CADRE R  (stop ATR / partiel 1R / trail 0.5R / paliers / zero rotation)
+ *  ------------------------------------------------------------
+ *  Decrets Calvin du 31/07 — valides par backtest chronologique (+98% vs +0.3%,
+ *  DD 10.2%, PF 1.35) ET par dissection de 40 trades reels :
+ *
+ *  1. STOP = 1.5 x ATR(14). Le SL -4.5% fixe valait 7.4 ATR sur BTC (jamais
+ *     touche -> pourrissait en rotation) et 1.6 ATR sur DEXE (dans le bruit).
+ *     Desormais 1R = "these invalidee", identique sur tous les symboles.
+ *  2. PARTIEL 50% a +1R, stop du reste au BREAK-EVEN (+frais). Encaisse le
+ *     mouvement reel, garantit qu'une position armee ne peut plus perdre.
+ *  3. TRAILING 0.5R apres le partiel (< 1R par construction : fini les sorties
+ *     "TRAILING" perdantes — 40% des sorties trailing reelles etaient negatives
+ *     avec l'ancien couple arm +1% / width -1.5%, mathematiquement incoherent).
+ *  4. ROTATION SUPPRIMEE : 7/10 rotations reelles declenchees entre 29.5 et
+ *     31.0 min = un reveil, pas un signal. Les gagnants murissent en 96 min,
+ *     la rotation les tuait a 30. En backtest : 253 rotations, 1% WR, -1108$.
+ *  5. PALIERS DE MISE par capital (7 paliers, decret) + modulation ATR dans la
+ *     fourchette (symbole calme -> haut de fourchette, volatil -> bas).
+ *  6. GARDE FRICTION : 1R >= 6 x frais AR (0.12% mesure sur les fills reels).
+ *     57% des trades reels vivaient sous 0.5% de mouvement : 2/23 gagnants,
+ *     frais = 24% du resultat. On ne trade plus dans le bruit.
+ *  7. JOURNAL EN R : chaque cloture logge son multiple de R.
+ *
+ *  HISTORIQUE 3.12j (fix course bonus / stops natifs algoOrder / garde marge)
  *  ------------------------------------------------------------
  *  Decret Calvin du 30/07 vs 3.12i :
  *
@@ -264,8 +287,21 @@ const STRAT = {
                         // -4%->+598 · -5%->+599 (optimum) · -6%->+482. En PORTEFEUILLE réel 1000$
                         // avec plancher ON : +77.1%/mois, DD -9.0%, WR 68.9%, 33 stops (vs 135 à -2%).
                         // Le stop large ne se fait toucher que par les VRAIS retournements, pas le bruit.
-  TRAIL_ARM: 0.010,     // trailing s'arme a +1.0%
-  TRAIL_PCT: 0.015,     // suiveur -1.5% du pic (LARGE : laisse courir vers 2-4%)
+  TRAIL_ARM: 0.010,     // (3.13a : conserve pour compat affichage — la gestion passe au cadre R)
+  TRAIL_PCT: 0.015,     // (3.13a : idem — voir ATR_SL_MULT/TRAIL_R ci-dessous)
+
+  // --- 3.13a CADRE R (decrets Calvin 31/07) ---
+  ATR_SL_MULT: 1.5,     // 1R = 1.5 x ATR(14) 1h — plage 1.0-2.5 toute rentable au backtest (pas d'optimum fragile)
+  PARTIAL_AT_R: 1.0,    // prise partielle a +1R
+  PARTIAL_FRAC: 0.5,    // 50% de la position encaissee au partiel
+  TRAIL_R: 0.5,         // trailing 0.5R apres partiel (< 1R par construction)
+  FRICTION_RT: 0.0012,  // frais aller-retour reels mesures (taker 2x0.045% + slippage ~0.03%)
+  FRICTION_MIN_R: 6,    // 1R doit valoir >= 6x la friction, sinon on ne trade pas ce symbole
+  STAKE_PALIERS: [      // [capital_max, mise_min, mise_max] — decret Calvin (7 paliers)
+    [800, 50, 100], [2200, 100, 175], [4000, 175, 290], [5000, 290, 445],
+    [12000, 445, 800], [35000, 1650, 3250], [Infinity, 1650, 5000],
+  ],
+  ATR_MOD_LO: 0.006, ATR_MOD_HI: 0.029, // bornes de modulation ATR dans la fourchette du palier
   TP_SOFT_CAP: 0.35,    // borne haute indicative +35% (securite, rarement atteinte)
   // Time-stop CONDITIONNEL (Option B) :
   //  - trade qui STAGNE (trailing jamais armé) -> fermé à 2h30 (libère le capital)
@@ -282,11 +318,7 @@ const STRAT = {
   TIME_STOP_WORKING_MS: 86400000, // 24h pour un gagnant qui travaille (laisser courir)
 
   // --- SCALING OUT : prise de profit PARTIELLE, on laisse courir le reste ---
-  SCALE_OUT: [
-    { at: 0.10, frac: 0.34 }, // a +10% : ferme 34% de la position
-    { at: 0.20, frac: 0.50 }, // a +20% : ferme 50% du RESTE
-    // le solde court sur le trailing large (capture les +20-35% comme NFPUSDT)
-  ],
+  SCALE_OUT: null,              // 3.13a : remplace par le PARTIEL a +1R du cadre R
 
   // --- Frais & execution ---
   FEE_MAKER: 0.0002, FEE_TAKER: 0.0005,
@@ -314,7 +346,7 @@ const STRAT = {
   MAX_EXPOSURE_PCT: 6.0, // exposition relevee a 600% (garde-fou)
 
   // --- ROTATION DE CAPITAL : fermer un mini-perdant essouffle pour un slot EXCELLENT ---
-  ROTATION_ENABLED: true,
+  ROTATION_ENABLED: false,      // 3.13a : SUPPRIMEE (decret 31/07) — 7/10 rotations reelles = horloge 30 min, tuait les gagnants (96 min de maturation moyenne)
   ROTATION_MAX_LOSS: 0.005,     // trade a fermer entre 0 et -0.5%
   ROTATION_MIN_AGE_MS: 1800000, // ouvert >= 30 min
   ROTATION_STALE_PEAK: 0.005,   // n'a jamais depasse +0.5%
@@ -1069,8 +1101,16 @@ function computeSignal(symbol, relaxAdd) {
 // Si l'ATR est indisponible ou USE_ATR_EXITS=false, on retombe sur SL_PCT/TP_PCT fixes.
 // Le TP ATR est borné [ATR_TP_FLOOR, ATR_TP_CAP] pour rester atteignable ET sûr.
 function computeExits(symbol) {
-  // Swing : SL fixe (STRAT.SL_PCT). Le TP est géré par le trailing large (pas de plafond dur).
-  return { slPct: STRAT.SL_PCT, tpPct: STRAT.TP_SOFT_CAP, source: 'swing' };
+  // 3.13a CADRE R : 1R = ATR_SL_MULT x ATR(14) du symbole. Le meme stop signifie
+  // la meme chose partout (BTC 0.6%/h vs DEXE 2.8%/h : facteur 4.6x — un %
+  // fixe etait soit dans le bruit, soit inatteignable). Fallback SL_PCT si ATR absent.
+  const sw = state.sym[symbol] && state.sym[symbol].swing;
+  const a = sw && Number.isFinite(sw.atrPct) ? sw.atrPct : null;
+  if (a && a > 0) {
+    const r = STRAT.ATR_SL_MULT * a;
+    return { slPct: r, tpPct: STRAT.TP_SOFT_CAP, rPct: r, source: 'atr' };
+  }
+  return { slPct: STRAT.SL_PCT, tpPct: STRAT.TP_SOFT_CAP, rPct: STRAT.SL_PCT, source: 'swing-fallback' };
 }
 
 // Levier progressif 2x -> 7x selon Q (premier palier atteint).
@@ -1093,7 +1133,7 @@ function tradesLastHour() {
 
 // Décide mise + levier, proportionnels à la qualité du signal (pleines mises :
 // le bridage "comblement" a été supprimé, il pénalisait les meilleurs signaux).
-function sizing(signal) {
+function sizing(signal, symbol) {
   if (signal.bonus) {
     // BONUS LOTERIE : mise petite (25-50$), levier x9 (decret 30/07).
     const s = Math.max(STRAT.BONUS_STAKE_MIN_USD, Math.min(STRAT.BONUS_STAKE_MAX_USD, state.capital * STRAT.BONUS_STAKE_PCT));
@@ -1107,7 +1147,23 @@ function sizing(signal) {
     const stake = STRAT.FILLER_STAKE_MIN_USD + frac * (STRAT.FILLER_STAKE_MAX_USD - STRAT.FILLER_STAKE_MIN_USD);
     return { stake: Math.round(stake), lev: STRAT.FILLER_LEV };
   }
-  const stake = STRAT.STAKE_MIN_USD + frac * (STRAT.STAKE_MAX_USD - STRAT.STAKE_MIN_USD);
+  // 3.13a PALIERS (decret Calvin) : fourchette de mise selon le capital, puis
+  // MODULATION ATR a l'interieur : symbole calme -> haut de fourchette, volatil -> bas.
+  // (Compromis valide au backtest : +80% en respectant les paliers, DD -4 pts vs mise fixe.)
+  let smin = 50, smax = 100;
+  for (const [cmax, lo, hi] of STRAT.STAKE_PALIERS) {
+    if (state.capital <= cmax) { smin = lo; smax = hi; break; }
+  }
+  const sw = symbol && state.sym[symbol] && state.sym[symbol].swing;
+  const a = sw && Number.isFinite(sw.atrPct) ? sw.atrPct : null;
+  let stake;
+  if (a != null) {
+    let z = (a - STRAT.ATR_MOD_LO) / (STRAT.ATR_MOD_HI - STRAT.ATR_MOD_LO);
+    z = Math.max(0, Math.min(1, z));
+    stake = smax - (smax - smin) * z;
+  } else {
+    stake = (smin + smax) / 2;
+  }
   const lev = levForQuality(signal.quality);
   return { stake: Math.round(stake), lev };
 }
@@ -1281,7 +1337,13 @@ async function tryOpen(symbol, signal) {
   // Cooldown après un stop sur ce symbole
   if (S.lastStopAt && now - S.lastStopAt < STRAT.COOLDOWN_AFTER_STOP_MS) return;
 
-  const { stake, lev } = sizing(signal);
+  const { stake, lev } = sizing(signal, symbol);
+
+  // 3.13a GARDE FRICTION : si 1R (stop ATR) ne vaut pas au moins 6x les frais
+  // aller-retour, le trade est un pile-ou-face a esperance negative (57% des
+  // trades reels vivaient sous 0.5% de mouvement : 2/23 gagnants). On skip.
+  const exitsPre = computeExits(symbol);
+  if (exitsPre.rPct < STRAT.FRICTION_MIN_R * STRAT.FRICTION_RT) return;
   if (openPositionsCount() >= STRAT.MAX_POSITIONS_CAP) {
     if (STRAT.ROTATION_ENABLED && signal.quality >= STRAT.ROTATION_MIN_Q) {
       const victim = findRotationCandidate(symbol);
@@ -1381,6 +1443,7 @@ async function tryOpen(symbol, signal) {
   S.position = {
     side: signal.side, entry, qty, stake, lev, quality: signal.quality,
     entryFill, slPct: exits.slPct, tpPct: exits.tpPct,
+    rPct: exits.rPct, partialDone: false, // 3.13a cadre R
     sl: signal.side === 'BUY' ? entry * (1 - exits.slPct) : entry * (1 + exits.slPct),
     tp: signal.side === 'BUY' ? entry * (1 + exits.tpPct) : entry * (1 - exits.tpPct),
     openedAt: now, peakPnl: 0, scaleDone: [],
@@ -1497,7 +1560,7 @@ async function closePos(symbol, reason, qtyToClose = null) {
     state.bonusStats.count++; state.bonusStats.net += net;
     if (net >= 0) state.bonusStats.wins++; else state.bonusStats.losses++;
   }
-  if (reason === 'STOP-LOSS') S.lastStopAt = Date.now();
+  if (reason === 'STOP-LOSS' || reason === 'STOP-1R') S.lastStopAt = Date.now();
   if (state.capital > state.peakCapital) state.peakCapital = state.capital;
   const dd = (state.peakCapital - state.capital) / state.peakCapital;
   if (dd > state.maxDrawdown) state.maxDrawdown = dd;
@@ -1510,7 +1573,8 @@ async function closePos(symbol, reason, qtyToClose = null) {
   });
   if (state.trades.length > 100) state.trades.pop();
 
-  logLine(`🔴 ${symbol} ${reason} @ ${exit.toFixed(4)} | net=${net.toFixed(2)}$ | capital=${state.capital.toFixed(2)}$`);
+  const rMult = (pos.rPct && pos.rPct > 0) ? (pnlPct / pos.rPct) : null; // 3.13a journal en R
+  logLine(`🔴 ${symbol} ${reason} @ ${exit.toFixed(4)} | ${rMult != null ? (rMult >= 0 ? '+' : '') + rMult.toFixed(2) + 'R | ' : ''}net=${net.toFixed(2)}$ | capital=${state.capital.toFixed(2)}$`);
   try { await cancelAlgoStops(symbol); } catch (e) {} S.position = null;
   broadcast({ type: 'trade', stats: state.stats, capital: state.capital, positions: livePositions() });
 
@@ -1642,31 +1706,42 @@ function managePosition(symbol) {
     return; // au-dessus du SL et non arme : on laisse vivre
   }
 
-  // 1) Stop-loss fixe (STRAT.SL_PCT)
-  if (pnlPct <= -pos.slPct) { closePos(symbol, 'STOP-LOSS'); return; }
+  // ================= 3.13a CADRE R =================
+  const rPct = pos.rPct || pos.slPct; // 1R fige a l'ouverture (ATR) ; fallback ancien SL
 
-  // 2) SCALING OUT : prise de profit partielle aux paliers, on garde le reste.
-  if (STRAT.SCALE_OUT && !pos.scaleDone) pos.scaleDone = [];
-  if (STRAT.SCALE_OUT) {
-    for (let i = 0; i < STRAT.SCALE_OUT.length; i++) {
-      const step = STRAT.SCALE_OUT[i];
-      if (!pos.scaleDone.includes(i) && pnlPct >= step.at && pos.qty > 0) {
-        pos.scaleDone.push(i);
-        const chunk = roundQty(symbol, pos.qty * step.frac);
-        if (chunk > 0 && chunk < pos.qty) { closePos(symbol, `SCALE+${(step.at*100).toFixed(0)}%`, chunk); return; }
-      }
+  // 1) STOP -1R : la these est invalidee. Perte = exactement 1R, partout.
+  if (!pos.partialDone && pnlPct <= -pos.slPct) { closePos(symbol, 'STOP-1R'); return; }
+
+  // 2) PARTIEL a +1R : encaisse PARTIAL_FRAC, stop du reste au BREAK-EVEN (+frais).
+  //    A partir d'ici la position ne peut mathematiquement plus finir perdante.
+  if (!pos.partialDone && pnlPct >= STRAT.PARTIAL_AT_R * rPct && pos.qty > 0) {
+    const chunk = roundQty(symbol, pos.qty * STRAT.PARTIAL_FRAC);
+    if (chunk > 0 && chunk < pos.qty) {
+      pos.partialDone = true;
+      pos.beFloor = STRAT.FEE_MAKER + STRAT.FEE_TAKER; // plancher : entree + frais
+      closePos(symbol, 'PARTIEL+1R', chunk);
+      // Stop natif Binance redeploye au break-even (asynchrone, non bloquant) :
+      // meme bot eteint, le reste de la position ne peut plus perdre.
+      pos.sl = pos.side === 'BUY' ? pos.entry * (1 + pos.beFloor) : pos.entry * (1 - pos.beFloor);
+      placeExchangeStops(symbol).catch(() => {});
+      return;
     }
   }
 
-  // 3) Trailing LARGE : armé à +1%, sort si on recule de 1.5% sous le pic (laisse courir)
-  if (pos.peakPnl >= STRAT.TRAIL_ARM) {
-    if (pos.peakPnl - pnlPct >= STRAT.TRAIL_PCT) { closePos(symbol, 'TRAILING'); return; }
+  // 3) Apres partiel : plancher = max(break-even, pic - TRAIL_R x R).
+  if (pos.partialDone) {
+    const floor = Math.max(pos.beFloor || 0, (pos.peakPnl || 0) - STRAT.TRAIL_R * rPct);
+    if (pnlPct <= floor) {
+      closePos(symbol, pnlPct > (pos.beFloor || 0) + 1e-9 ? 'TRAIL-R' : 'BREAK-EVEN');
+      return;
+    }
   }
+
   // 4) Borne haute de sécurité (rarement atteinte)
   if (pnlPct >= STRAT.TP_SOFT_CAP) { closePos(symbol, 'TAKE-PROFIT'); return; }
   // Time-stop révisé (backtest) : le time-stop "stagnant" est DÉSACTIVÉ (0 = le SL seul gère) ;
   // un trade qui travaille (trailing armé) est borné à 24h pour laisser courir les gagnants.
-  const trailingArmed = pos.peakPnl != null && pos.peakPnl >= STRAT.TRAIL_ARM;
+  const trailingArmed = pos.partialDone === true; // 3.13a : "travaille" = partiel pris
   const timeLimit = trailingArmed ? STRAT.TIME_STOP_WORKING_MS : STRAT.TIME_STOP_STALE_MS;
   // timeLimit=0 -> time-stop DÉSACTIVÉ pour cet état (le trade n'est pas coupé par le temps).
   if (timeLimit > 0 && age >= timeLimit) { closePos(symbol, trailingArmed ? 'TIME-STOP-24H' : 'TIME-STOP-STALE'); return; }
@@ -1804,6 +1879,7 @@ async function reconcile() {
           side: r.side, entry: r.entry, qty: r.qty, stake, lev: r.lev,
           quality: 0, entryFill: 'taker',
           slPct: exits.slPct, tpPct: exits.tpPct,
+          rPct: exits.rPct, partialDone: false, // 3.13a cadre R (adoption)
           sl: r.side === 'BUY' ? r.entry * (1 - exits.slPct) : r.entry * (1 + exits.slPct),
           tp: r.side === 'BUY' ? r.entry * (1 + exits.tpPct) : r.entry * (1 - exits.tpPct),
           openedAt: Date.now(), peakPnl: 0, scaleDone: [], adopted: true,
@@ -2145,11 +2221,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
   <div class="head">
     <span class="logo">CryptoSignal<span class="c">AI</span> · Multi</span>
-    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.12j - Champion · 40 sym <span style="opacity:.6;font-weight:600">· WR ~70%</span></span>
+    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.13a - Cadre R · 40 sym <span style="opacity:.6;font-weight:600">· WR ~49% · +0.6R/trade</span></span>
     <span id="mode" class="badge net">TESTNET</span>
     <span id="run" class="badge off">PAUSE</span>
   </div>
-  <div class="sub" id="stratline">3.12j-Champion · bonus Q70+ x9 · mises x2 · garde marge · SL -4.5% (optimisé) · trailing +1%/-1.5% · multi-régime</div>
+  <div class="sub" id="stratline">3.13a-Cadre R · stop 1.5 ATR · partiel 50% +1R · trail 0.5R · paliers de mise · garde friction · bonus Q70+ x9 · zéro rotation</div>
 
   <div class="card" style="margin-bottom:12px">
     <div class="k" style="color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.5px">Connexion Binance</div>
@@ -2246,7 +2322,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     if($('toggleRelax'))$('toggleRelax').textContent='🔧 Assoupli: '+(s.strat&&s.strat.relaxOn?'ON':'OFF');
     if($('toggleFloor'))$('toggleFloor').textContent='🎯 Plancher 4/h: '+(s.strat&&s.strat.floorOn?'ON':'OFF');
     if($('toggleBonus')){var bs=s.bonusStats||{count:0,wins:0,losses:0,net:0};$('toggleBonus').textContent='🎰 Bonus: '+(s.strat&&s.strat.bonusOn?'ON':'OFF')+(bs.count?' ('+bs.wins+'W/'+bs.losses+'L '+(bs.net>=0?'+':'')+bs.net.toFixed(0)+'$)':'');}
-    $('stratline').textContent='3.12j-Champion · SL -'+(s.strat?s.strat.sl.toFixed(1):4.5)+'% (optimisé backtest) · trailing +'+(s.strat?s.strat.trailArm:1)+'%/-'+(s.strat?s.strat.trailPct:1.5)+'% · bonus loterie Q70+ 25-50$ x9 SL-5% · garde marge · laisse courir 24h · multi-régime (RANGE→MR / UP→long / DOWN→short) · x2-5';
+    $('stratline').textContent='3.13a-Cadre R · stop 1.5×ATR(14) · partiel 50% à +1R puis break-even · trail 0.5R · paliers de mise par capital + modulation ATR · garde friction 6× · bonus loterie Q70+ 25-50$ x9 SL-5% · zéro rotation · multi-régime · x2-5';
       if($('connInfo')) $('connInfo').textContent = s.connected ? ('🔐 Connecté '+(s.mode||'').toUpperCase()+' — clé '+(s.keyPrefix||'')+'…') : '⚠️ Non connecté — lecture seule (choisis un mode, colle tes clés, 🔐 Connecter)';
     if(s.connected && $('btnConnect') && $('btnConnect').textContent.indexOf('⏳')===0){ $('apiKey').value=''; $('apiSecret').value=''; $('btnConnect').textContent='🔐 Connecter'; selMode=null; }
     paintTabs(s.mode);
@@ -2418,8 +2494,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // DÉMARRAGE
 // ==================================================================
 async function start() {
-  logLine(`\u{1F680} Itachi — SERVEUR 3.12j-Champion (fix course bonus / stops natifs algoOrder / garde marge — decrets Calvin 30/07) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
-  logLine(`\u{1F4C8} 3.12j-Champion — SL -4.5% (optimise) / trailing +1%/-1.5% — bonus loterie Q70+ 25-50$ x9 SL -5% — garde marge anti-2019 — x2-5 — mise 160-560$ — 6 pos — seuils +15%`);
+  logLine(`\u{1F680} Itachi — SERVEUR 3.13a-Cadre R (stop ATR / partiel 1R / trail 0.5R / paliers / zero rotation — decrets Calvin 31/07) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
+  logLine(`\u{1F4C8} 3.13a-Cadre R — stop 1.5xATR(14) / partiel 50% a +1R -> break-even / trail 0.5R — paliers de mise + modulation ATR — garde friction 6x — bonus x9 SL -5% — zero rotation — x2-5 — 6 pos`);
   if (!API_KEY || !API_SECRET) logLine('\u26A0\uFE0F Aucune cle — choisis TESTNET/MAINNET dans le dashboard, colle tes cles et clique 🔐 Connecter.');
   else logLine(`🔐 Cles trouvees en variables d'environnement — mode ${MODE.toUpperCase()} pre-connecte (reconnexion auto post-redeploiement).`);
 
