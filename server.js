@@ -1,5 +1,18 @@
 /* ============================================================
- *  SERVEUR 3.13a - CADRE R  (stop ATR / partiel 1R / trail 0.5R / paliers / zero rotation)
+ *  SERVEUR 3.13b - CADRE R  (+ verrou d'entree anti-course / priorite Q / stops idempotents)
+ *  ------------------------------------------------------------
+ *  Trois decrets Calvin du 31/07 vs 3.13a (fix du 8/6 constate en reel) :
+ *  1. VERROU D'ENTREE : cap et exposition testes AVEC les entrees "en vol",
+ *     slot+mise reserves de facon SYNCHRONE avant le premier await, liberes en
+ *     finally. 5 ouvertures a la meme seconde au boot avaient defonce le cap
+ *     (8/6) et la garde marge (cache 10s aveugle aux mises deja parties -> -2019
+ *     sur AKEUSDT malgre la garde). Meme pattern que le verrou bonus 3.12j.
+ *  2. PRIORITE Q : a signaux simultanes, micro-delai (100-Q)x3 ms avant la
+ *     course -> le meilleur signal reserve son slot en premier.
+ *  3. STOPS NATIFS IDEMPOTENTS : deja poses au meme prix -> on ne re-pose pas
+ *     (la 2e tentative post-adoption partait en -4130 sur ETHUSDT).
+ *
+ *  HISTORIQUE 3.13a - CADRE R  (stop ATR / partiel 1R / trail 0.5R / paliers / zero rotation)
  *  ------------------------------------------------------------
  *  Decrets Calvin du 31/07 — valides par backtest chronologique (+98% vs +0.3%,
  *  DD 10.2%, PF 1.35) ET par dissection de 40 trades reels :
@@ -1185,6 +1198,22 @@ async function freeMarginUSDT() {
   return _freeMarginCache.val;
 }
 
+// 3.13b : SLOTS & MISES RESERVES — entrees "en vol" entre la decision et la
+// confirmation de l'ordre. symbolTick tourne en CONCURRENCE (appels sans await) :
+// tout test cap/marge effectue avant un await reseau est perime a l'execution.
+// Reservation SYNCHRONE (aucun await entre test et reservation) + liberation en
+// finally : la fenetre de course est fermee par construction.
+function reservedSlots() { return state._resSlots || 0; }
+function reservedStakeUSD() { return state._resStake || 0; }
+function reserveEntry(stake) {
+  state._resSlots = (state._resSlots || 0) + 1;
+  state._resStake = (state._resStake || 0) + stake;
+}
+function releaseEntry(stake) {
+  state._resSlots = Math.max(0, (state._resSlots || 0) - 1);
+  state._resStake = Math.max(0, (state._resStake || 0) - stake);
+}
+
 function currentExposure() {
   let total = 0;
   for (const s of ALL_SYMBOLS) if (state.sym[s].position) total += state.sym[s].position.stake;
@@ -1344,7 +1373,16 @@ async function tryOpen(symbol, signal) {
   // trades reels vivaient sous 0.5% de mouvement : 2/23 gagnants). On skip.
   const exitsPre = computeExits(symbol);
   if (exitsPre.rPct < STRAT.FRICTION_MIN_R * STRAT.FRICTION_RT) return;
-  if (openPositionsCount() >= STRAT.MAX_POSITIONS_CAP) {
+
+  // 3.13b PRIORITE Q : a signaux simultanes (typique au boot), le meilleur Q
+  // attend le moins longtemps et reserve son slot en premier. Q85 -> 45ms,
+  // Q50 -> 150ms. Douce, sans coordination centrale, suffisante pour ordonner.
+  await new Promise((r) => setTimeout(r, Math.max(0, (100 - (signal.quality || 0)) * 3)));
+  if (!state.running || S.position || S.disabled) return; // re-check post-delai
+
+  // 3.13b : cap teste AVEC les entrees en vol (reservees, pas encore visibles
+  // dans openPositionsCount) — c'est le trou par lequel le 8/6 est passe.
+  if (openPositionsCount() + reservedSlots() >= STRAT.MAX_POSITIONS_CAP) {
     if (STRAT.ROTATION_ENABLED && signal.quality >= STRAT.ROTATION_MIN_Q) {
       const victim = findRotationCandidate(symbol);
       if (victim) {
@@ -1354,7 +1392,12 @@ async function tryOpen(symbol, signal) {
       } else { return; }
     } else { return; }
   }
-  if (currentExposure() + stake > state.capital * STRAT.MAX_EXPOSURE_PCT) return;
+  if (currentExposure() + reservedStakeUSD() + stake > state.capital * STRAT.MAX_EXPOSURE_PCT) return;
+
+  // 3.13b : RESERVATION SYNCHRONE (aucun await entre les tests ci-dessus et cette
+  // ligne). Tout ce qui suit est couvert par le finally de liberation.
+  reserveEntry(stake);
+  try {
 
   // 3.12i GARDE MARGE : la marge initiale requise ~= stake (qty*px/lev = stake).
   // Si la marge libre REELLE du compte ne couvre pas stake x BUFFER, l'ordre
@@ -1363,7 +1406,10 @@ async function tryOpen(symbol, signal) {
   // symbole). Log throttle 60s pour ne pas inonder le journal.
   if (STRAT.MARGIN_GUARD && API_KEY && API_SECRET) {
     const free = await freeMarginUSDT();
-    if (free != null && free < stake * STRAT.MARGIN_BUFFER) {
+    // 3.13b : la marge (cache 10s) doit couvrir TOUTES les mises en vol (la
+    // notre incluse via reservedStakeUSD) — le cache ne voit pas les ordres
+    // partis il y a <10s, la reservation comble cet angle mort (-2019 AKEUSDT).
+    if (free != null && free < Math.max(stake, reservedStakeUSD()) * STRAT.MARGIN_BUFFER) {
       if (!state._marginLogAt || now - state._marginLogAt > 60000) {
         state._marginLogAt = now;
         logLine(`\u26D4 marge libre ${free.toFixed(0)}$ < requise ~${Math.round(stake * STRAT.MARGIN_BUFFER)}$ — ouverture ${symbol} sautée (garde anti--2019).`);
@@ -1466,6 +1512,11 @@ async function tryOpen(symbol, signal) {
   // trailing logiciel arme a +100% de la mise, sans plafond de gain).
   await placeExchangeStops(symbol);
   broadcast({ type: 'positions', positions: livePositions() });
+
+  // 3.13b : fin du bloc reserve — liberation dans le finally ci-dessous.
+  } finally {
+    releaseEntry(stake);
+  }
 }
 
 async function closePos(symbol, reason, qtyToClose = null) {
@@ -1639,9 +1690,13 @@ async function placeExchangeStops(symbol) {
   // 3.12g : le bonus a desormais un SL natif -5% (decret Calvin 26/07). Seul le TP
   // natif reste exclu pour lui (TP = trailing logiciel +100% de mise, sans plafond).
   const closeSide = pos.side === 'BUY' ? 'SELL' : 'BUY';
-  await cancelAlgoStops(symbol); // purge anti-doublon (au trailing, pos.sl a pu bouger)
   const slPrice = roundPrice(symbol, pos.sl);
   const tpPrice = roundPrice(symbol, pos.tp);
+  // 3.13b IDEMPOTENCE : stops deja poses a CE prix -> ne pas re-poser (la 2e
+  // tentative post-adoption partait en -4130 sur ETHUSDT le 31/07). La purge et
+  // la re-pose n'ont lieu que si le SL a effectivement bouge (BE, trailing).
+  if (pos.exchangeStops && pos.exchangeSlPrice === slPrice) return 1;
+  await cancelAlgoStops(symbol); // purge anti-doublon (au trailing, pos.sl a pu bouger)
   const placeNative = async (orderType, triggerPrice) => {
     // Essai 1 : /fapi/v1/algoOrder — endpoint OFFICIEL des conditionnels depuis la
     // migration 09/12/2025. Schema exact (doc "New Algo Order") : algoType CONDITIONAL,
@@ -2221,11 +2276,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
   <div class="head">
     <span class="logo">CryptoSignal<span class="c">AI</span> · Multi</span>
-    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.13a - Cadre R · 40 sym <span style="opacity:.6;font-weight:600">· WR ~49% · +0.6R/trade</span></span>
+    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.13b - Cadre R · 40 sym <span style="opacity:.6;font-weight:600">· WR ~49% · +0.6R/trade</span></span>
     <span id="mode" class="badge net">TESTNET</span>
     <span id="run" class="badge off">PAUSE</span>
   </div>
-  <div class="sub" id="stratline">3.13a-Cadre R · stop 1.5 ATR · partiel 50% +1R · trail 0.5R · paliers de mise · garde friction · bonus Q70+ x9 · zéro rotation</div>
+  <div class="sub" id="stratline">3.13b-Cadre R · stop 1.5 ATR · partiel 50% +1R · trail 0.5R · paliers de mise · garde friction · verrou d'entrée · bonus Q70+ x9 · zéro rotation</div>
 
   <div class="card" style="margin-bottom:12px">
     <div class="k" style="color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.5px">Connexion Binance</div>
@@ -2322,7 +2377,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     if($('toggleRelax'))$('toggleRelax').textContent='🔧 Assoupli: '+(s.strat&&s.strat.relaxOn?'ON':'OFF');
     if($('toggleFloor'))$('toggleFloor').textContent='🎯 Plancher 4/h: '+(s.strat&&s.strat.floorOn?'ON':'OFF');
     if($('toggleBonus')){var bs=s.bonusStats||{count:0,wins:0,losses:0,net:0};$('toggleBonus').textContent='🎰 Bonus: '+(s.strat&&s.strat.bonusOn?'ON':'OFF')+(bs.count?' ('+bs.wins+'W/'+bs.losses+'L '+(bs.net>=0?'+':'')+bs.net.toFixed(0)+'$)':'');}
-    $('stratline').textContent='3.13a-Cadre R · stop 1.5×ATR(14) · partiel 50% à +1R puis break-even · trail 0.5R · paliers de mise par capital + modulation ATR · garde friction 6× · bonus loterie Q70+ 25-50$ x9 SL-5% · zéro rotation · multi-régime · x2-5';
+    $('stratline').textContent='3.13b-Cadre R · stop 1.5×ATR(14) · partiel 50% à +1R puis break-even · trail 0.5R · paliers de mise par capital + modulation ATR · garde friction 6× · bonus loterie Q70+ 25-50$ x9 SL-5% · zéro rotation · multi-régime · x2-5';
       if($('connInfo')) $('connInfo').textContent = s.connected ? ('🔐 Connecté '+(s.mode||'').toUpperCase()+' — clé '+(s.keyPrefix||'')+'…') : '⚠️ Non connecté — lecture seule (choisis un mode, colle tes clés, 🔐 Connecter)';
     if(s.connected && $('btnConnect') && $('btnConnect').textContent.indexOf('⏳')===0){ $('apiKey').value=''; $('apiSecret').value=''; $('btnConnect').textContent='🔐 Connecter'; selMode=null; }
     paintTabs(s.mode);
@@ -2494,8 +2549,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // DÉMARRAGE
 // ==================================================================
 async function start() {
-  logLine(`\u{1F680} Itachi — SERVEUR 3.13a-Cadre R (stop ATR / partiel 1R / trail 0.5R / paliers / zero rotation — decrets Calvin 31/07) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
-  logLine(`\u{1F4C8} 3.13a-Cadre R — stop 1.5xATR(14) / partiel 50% a +1R -> break-even / trail 0.5R — paliers de mise + modulation ATR — garde friction 6x — bonus x9 SL -5% — zero rotation — x2-5 — 6 pos`);
+  logLine(`\u{1F680} Itachi — SERVEUR 3.13b-Cadre R (cadre R + verrou d'entree anti-course / priorite Q / stops idempotents — decrets Calvin 31/07) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
+  logLine(`\u{1F4C8} 3.13b-Cadre R — stop 1.5xATR(14) / partiel 50% a +1R -> break-even / trail 0.5R — paliers + modulation ATR — garde friction 6x — verrou d'entree (cap 6 STRICT) — bonus x9 SL -5% — zero rotation — x2-5`);
   if (!API_KEY || !API_SECRET) logLine('\u26A0\uFE0F Aucune cle — choisis TESTNET/MAINNET dans le dashboard, colle tes cles et clique 🔐 Connecter.');
   else logLine(`🔐 Cles trouvees en variables d'environnement — mode ${MODE.toUpperCase()} pre-connecte (reconnexion auto post-redeploiement).`);
 
