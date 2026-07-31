@@ -1,5 +1,19 @@
 /* ============================================================
- *  SERVEUR 3.13b - CADRE R  (+ verrou d'entree anti-course / priorite Q / stops idempotents)
+ *  SERVEUR 3.13c - CADRE R  (+ reactivite : user data stream / bookTicker WS / stops paralleles)
+ *  ------------------------------------------------------------
+ *  Trois ameliorations de PLOMBERIE (decret Calvin 31/07 : strategie intouchee,
+ *  parity check : sizing/computeExits/managePosition SHA-256 identiques) :
+ *  1. USER DATA STREAM : Binance pousse chaque execution (stops natifs inclus)
+ *     en ~50ms -> reconciliation immediate (debounce 300ms) au lieu du cycle 9s.
+ *     Zero logique comptable dupliquee : la reconciliation existante reste
+ *     l'unique juge, on l'appelle juste plus tot. Le cycle 9s reste en filet.
+ *  2. bookTicker WS : bid/ask en continu par symbole -> le garde-fou carnet a
+ *     l'entree lit la memoire (0ms, flux < 5s) au lieu d'un REST ~100-300ms
+ *     DANS la section a slot reserve. REST conserve en fallback.
+ *  3. STOPS NATIFS SL+TP en PARALLELE : ~150-300ms gagnes par ouverture et par
+ *     adoption ; la position est protegee des deux cotes plus tot.
+ *
+ *  HISTORIQUE 3.13b - CADRE R  (+ verrou d'entree anti-course / priorite Q / stops idempotents)
  *  ------------------------------------------------------------
  *  Trois decrets Calvin du 31/07 vs 3.13a (fix du 8/6 constate en reel) :
  *  1. VERROU D'ENTREE : cap et exposition testes AVEC les entrees "en vol",
@@ -534,6 +548,7 @@ async function connectBinance(mode, key, secret) {
     // Reconnexion FORCEE du flux prix sur la base WS du nouveau mode :
     if (priceWs) { const old = priceWs; priceWs = null; try { old.close(); } catch (e) {} }
     connectPriceStreams();
+    startUserDataStream(); // 3.13c : flux prive (non bloquant, no-op sans cles)
     await refreshAllKlines();
     logLine(`✅ ${MODE.toUpperCase()} pret — ${ALL_SYMBOLS.length} symboles — clique ▶ Demarrer pour armer.`);
   } catch (e) {
@@ -1439,12 +1454,19 @@ async function tryOpen(symbol, signal) {
   // sur testnet, certains carnets sont VIDES -> ordres market rejetés (-4131),
   // positions infermables. Règle : on n'ouvre pas ce qu'on ne peut pas fermer.
   try {
-    const bt = await publicGet(REST_BASE, '/fapi/v1/ticker/bookTicker', { symbol });
-    const bid = parseFloat(bt.bidPrice), ask = parseFloat(bt.askPrice);
+    // 3.13c : lecture memoire si le flux bookTicker est frais (<5s) -> 0ms au lieu
+    // d'un REST ~100-300ms DANS la section a slot reserve. Meme test, memes seuils.
+    let bid, ask;
+    if (S.book && S.book.at && Date.now() - S.book.at < 5000) {
+      bid = S.book.bid; ask = S.book.ask;
+    } else {
+      const bt = await publicGet(REST_BASE, '/fapi/v1/ticker/bookTicker', { symbol });
+      bid = parseFloat(bt.bidPrice); ask = parseFloat(bt.askPrice);
+    }
     const spread = (bid > 0 && ask > 0) ? (ask - bid) / ((ask + bid) / 2) : Infinity;
     if (!(bid > 0) || !(ask > 0) || spread > 0.01) {
       S.disabled = true;
-      logLine(`🚫 ${symbol} exclu : carnet ${MODE} sans contrepartie exploitable (bid=${bt.bidPrice||'-'} ask=${bt.askPrice||'-'}, spread ${isFinite(spread)?(spread*100).toFixed(2)+'%':'∞'}) — position serait infermable.`);
+      logLine(`🚫 ${symbol} exclu : carnet ${MODE} sans contrepartie exploitable (bid=${bid||'-'} ask=${ask||'-'}, spread ${isFinite(spread)?(spread*100).toFixed(2)+'%':'∞'}) — position serait infermable.`);
       return;
     }
   } catch (e) { return; } // carnet illisible -> on n'ouvre pas, on retentera au prochain signal
@@ -1724,9 +1746,11 @@ async function placeExchangeStops(symbol) {
       }
     }
   };
-  let ok = 0;
-  if (await placeNative('STOP_MARKET', slPrice)) ok++;
-  if (!pos.bonus && await placeNative('TAKE_PROFIT_MARKET', tpPrice)) ok++;
+  // 3.13c : SL et TP poses en PARALLELE (~150-300ms gagnes ; protection complete plus tot).
+  const jobs = [placeNative('STOP_MARKET', slPrice)];
+  if (!pos.bonus) jobs.push(placeNative('TAKE_PROFIT_MARKET', tpPrice));
+  const results = await Promise.all(jobs);
+  let ok = results.filter(Boolean).length;
   pos.exchangeStops = ok > 0; // true seulement si au moins le SL est posé côté Binance
   if (ok) pos.exchangeSlPrice = slPrice;
   return ok;
@@ -1977,12 +2001,52 @@ let priceWs = null;
 // PLUS RIEN (mutisme silencieux, aucun message d'erreur). On vise /market en
 // premier, avec un WATCHDOG : 25s sans prix -> bascule de route + reconnexion
 // (auto-reparation si le testnet/demo ou une future migration differe).
+// ================== 3.13c : USER DATA STREAM (reactivite pure) ==================
+// Flux WebSocket PRIVE Binance : ORDER_TRADE_UPDATE / ACCOUNT_UPDATE pousses en
+// ~50ms des qu'un ordre s'execute (stops natifs algoOrder inclus). On ne duplique
+// AUCUNE comptabilite : on declenche juste la reconciliation existante (Binance =
+// source de verite) immediatement, avec un debounce 300ms. Le cycle 9s reste en filet.
+let userWs = null, _listenKey = null, _lkTimer = null, _fastReconTimer = null;
+function scheduleFastReconcile() {
+  if (_fastReconTimer) return;
+  _fastReconTimer = setTimeout(() => {
+    _fastReconTimer = null;
+    try { const p = reconcile(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+  }, 300);
+}
+async function startUserDataStream() {
+  if (!API_KEY || !API_SECRET) return; // lecture seule : rien a ecouter
+  try {
+    if (userWs) { const o = userWs; userWs = null; try { o.close(); } catch (e) {} }
+    if (_lkTimer) { clearInterval(_lkTimer); _lkTimer = null; }
+    const r = await signedRequest('POST', '/fapi/v1/listenKey', {});
+    _listenKey = r && r.listenKey;
+    if (!_listenKey) return;
+    // Keepalive : Binance expire la listenKey apres 60 min sans PUT -> PUT / 30 min.
+    _lkTimer = setInterval(() => { try { const p = signedRequest('PUT', '/fapi/v1/listenKey', {}); if (p && p.catch) p.catch(() => {}); } catch (e) {} }, 1800000);
+    const ws = new WebSocket(`${WS_BASE}/ws/${_listenKey}`);
+    userWs = ws;
+    ws.on('open', () => logLine('\u{1F50C} User Data Stream connecté — exécutions poussées en ~50ms (réconciliation 9s en filet).'));
+    ws.on('message', (raw) => {
+      try {
+        const m = JSON.parse(raw);
+        const ev = m.e || (m.data && m.data.e);
+        if (ev === 'ORDER_TRADE_UPDATE' || ev === 'ACCOUNT_UPDATE') scheduleFastReconcile();
+        else if (ev === 'listenKeyExpired') { logLine('\u26A0\uFE0F listenKey expirée — renouvellement du User Data Stream.'); startUserDataStream(); }
+      } catch (e) { /* ignore */ }
+    });
+    ws.on('close', () => { if (userWs === ws) { userWs = null; setTimeout(startUserDataStream, 3000); } });
+    ws.on('error', () => { /* le close ci-dessus gere la reconnexion */ });
+  } catch (e) { /* non bloquant : la reconciliation 9s couvre tout */ }
+}
+
 const WS_ROUTES = ['/market', ''];
 let _wsRouteIdx = 0;
 function connectPriceStreams() {
   if (!ALL_SYMBOLS.length) { setTimeout(connectPriceStreams, 2000); return; }
   const route = WS_ROUTES[_wsRouteIdx % WS_ROUTES.length];
-  const streams = ALL_SYMBOLS.map((s) => `${s.toLowerCase()}@markPrice@1s`).join('/');
+  // 3.13c : + @bookTicker par symbole -> bid/ask en continu (garde-fou carnet a 0ms).
+  const streams = ALL_SYMBOLS.map((s) => `${s.toLowerCase()}@markPrice@1s/${s.toLowerCase()}@bookTicker`).join('/');
   const url = `${WS_BASE}${route}/stream?streams=${streams}`;
   const ws = new WebSocket(url);
   priceWs = ws;
@@ -2005,6 +2069,12 @@ function connectPriceStreams() {
       const msg = JSON.parse(raw);
       const d = msg.data || msg;
       const sym = (d.s || '').toUpperCase();
+      // 3.13c : evenement bookTicker -> mise a jour du carnet en memoire, pas un tick prix.
+      if (d.e === 'bookTicker' && sym && state.sym[sym]) {
+        const bid = parseFloat(d.b), ask = parseFloat(d.a), mid = (bid + ask) / 2;
+        if (bid > 0 && ask > 0 && mid > 0) state.sym[sym].book = { bid, ask, spreadPct: (ask - bid) / mid, at: Date.now() };
+        return;
+      }
       const p = parseFloat(d.p || d.markPrice);
       if (sym && state.sym[sym] && p > 0) {
         const S = state.sym[sym];
@@ -2053,7 +2123,7 @@ async function refreshAllKlines() {
     for (const b of (Array.isArray(books) ? books : [])) {
       const S = state.sym[b.symbol]; if (!S) continue;
       const bid = +b.bidPrice, ask = +b.askPrice, mid = (bid + ask) / 2;
-      S.book = { bid, ask, spreadPct: (bid > 0 && ask > 0 && mid > 0) ? (ask - bid) / mid : Infinity };
+      S.book = { bid, ask, spreadPct: (bid > 0 && ask > 0 && mid > 0) ? (ask - bid) / mid : Infinity, at: Date.now() };
     }
   } catch (e) { /* silencieux : prochain cycle */ }
   const BATCH = 4;
@@ -2276,11 +2346,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
   <div class="head">
     <span class="logo">CryptoSignal<span class="c">AI</span> · Multi</span>
-    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.13b - Cadre R · 40 sym <span style="opacity:.6;font-weight:600">· WR ~49% · +0.6R/trade</span></span>
+    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.13c - Cadre R · 40 sym <span style="opacity:.6;font-weight:600">· WR ~49% · +0.6R/trade</span></span>
     <span id="mode" class="badge net">TESTNET</span>
     <span id="run" class="badge off">PAUSE</span>
   </div>
-  <div class="sub" id="stratline">3.13b-Cadre R · stop 1.5 ATR · partiel 50% +1R · trail 0.5R · paliers de mise · garde friction · verrou d'entrée · bonus Q70+ x9 · zéro rotation</div>
+  <div class="sub" id="stratline">3.13c-Cadre R · stop 1.5 ATR · partiel 50% +1R · trail 0.5R · paliers de mise · garde friction · verrou d'entrée · bonus Q70+ x9 · zéro rotation</div>
 
   <div class="card" style="margin-bottom:12px">
     <div class="k" style="color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.5px">Connexion Binance</div>
@@ -2377,7 +2447,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     if($('toggleRelax'))$('toggleRelax').textContent='🔧 Assoupli: '+(s.strat&&s.strat.relaxOn?'ON':'OFF');
     if($('toggleFloor'))$('toggleFloor').textContent='🎯 Plancher 4/h: '+(s.strat&&s.strat.floorOn?'ON':'OFF');
     if($('toggleBonus')){var bs=s.bonusStats||{count:0,wins:0,losses:0,net:0};$('toggleBonus').textContent='🎰 Bonus: '+(s.strat&&s.strat.bonusOn?'ON':'OFF')+(bs.count?' ('+bs.wins+'W/'+bs.losses+'L '+(bs.net>=0?'+':'')+bs.net.toFixed(0)+'$)':'');}
-    $('stratline').textContent='3.13b-Cadre R · stop 1.5×ATR(14) · partiel 50% à +1R puis break-even · trail 0.5R · paliers de mise par capital + modulation ATR · garde friction 6× · bonus loterie Q70+ 25-50$ x9 SL-5% · zéro rotation · multi-régime · x2-5';
+    $('stratline').textContent='3.13c-Cadre R · stop 1.5×ATR(14) · partiel 50% à +1R puis break-even · trail 0.5R · paliers de mise par capital + modulation ATR · garde friction 6× · bonus loterie Q70+ 25-50$ x9 SL-5% · zéro rotation · multi-régime · x2-5';
       if($('connInfo')) $('connInfo').textContent = s.connected ? ('🔐 Connecté '+(s.mode||'').toUpperCase()+' — clé '+(s.keyPrefix||'')+'…') : '⚠️ Non connecté — lecture seule (choisis un mode, colle tes clés, 🔐 Connecter)';
     if(s.connected && $('btnConnect') && $('btnConnect').textContent.indexOf('⏳')===0){ $('apiKey').value=''; $('apiSecret').value=''; $('btnConnect').textContent='🔐 Connecter'; selMode=null; }
     paintTabs(s.mode);
@@ -2549,8 +2619,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // DÉMARRAGE
 // ==================================================================
 async function start() {
-  logLine(`\u{1F680} Itachi — SERVEUR 3.13b-Cadre R (cadre R + verrou d'entree anti-course / priorite Q / stops idempotents — decrets Calvin 31/07) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
-  logLine(`\u{1F4C8} 3.13b-Cadre R — stop 1.5xATR(14) / partiel 50% a +1R -> break-even / trail 0.5R — paliers + modulation ATR — garde friction 6x — verrou d'entree (cap 6 STRICT) — bonus x9 SL -5% — zero rotation — x2-5`);
+  logLine(`\u{1F680} Itachi — SERVEUR 3.13c-Cadre R (reactivite : user data stream ~50ms / bookTicker WS / stops paralleles — decrets Calvin 31/07) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
+  logLine(`\u{1F4C8} 3.13c-Cadre R — strategie 3.13b intouchee — + user data stream (executions ~50ms) / bookTicker WS (carnet 0ms) / stops natifs SL+TP paralleles`);
   if (!API_KEY || !API_SECRET) logLine('\u26A0\uFE0F Aucune cle — choisis TESTNET/MAINNET dans le dashboard, colle tes cles et clique 🔐 Connecter.');
   else logLine(`🔐 Cles trouvees en variables d'environnement — mode ${MODE.toUpperCase()} pre-connecte (reconnexion auto post-redeploiement).`);
 
