@@ -1,5 +1,27 @@
 /* ============================================================
- *  SERVEUR 3.13d - CADRE R  (+ plafond de risque $ : le levier s'ajuste a la volatilite)
+ *  SERVEUR 3.13e - CADRE R BIMODAL  (mode volatil / persistance / fraicheur / stats.csv)
+ *  ------------------------------------------------------------
+ *  Decrets Calvin du 08/08 :
+ *  1. MODE VOLATIL — le cadre R devient BIMODAL. Si 1R > 5% (symbole sauvage) :
+ *     partiel 60% a +0.4R, stop -0.6R, trailing 0.25R. C'est l'automatisation
+ *     exacte des fermetures manuelles gagnantes de Calvin (encaisser +3-5% sans
+ *     attendre un +13% improbable). Backtest chronologique : regime violent
+ *     +1117$ vs +403$ et DD 9.7% vs 36.7% ; regime calme +1088$ vs +980$.
+ *     Seule brique robuste sur les DEUX regimes (correlation et time-stop 12h
+ *     testes et REJETES). Sous 5% de 1R : strictement rien ne change.
+ *  2. PERSISTANCE state.json : capital, stats, historique et compteur de trades
+ *     sauvegardes (60s + a chaque cloture), recharges au boot si MODE identique.
+ *     Fini les paliers calcules sur un capital fictif apres redemarrage.
+ *  3. GARDE FRAICHEUR PRIX : prix plus vieux que 15s -> aucune entree, aucun
+ *     stop LOGICIEL (les stops natifs Binance couvrent). Un WebSocket gele ne
+ *     fait plus decider le bot sur des prix morts.
+ *  4. /stats.csv : export complet de l'historique (Excel / bilans / futur agent).
+ *  5. LOGS DE REFUS (throttle 10 min/symbole) : friction, plafond de risque,
+ *     prix gele — le bot dit desormais POURQUOI il n'entre pas.
+ *  6. Labels natifs scindes : 'SL NATIF' / 'TP NATIF' (fini l'ambigu 'SL/TP').
+ *  7. Trades NUMEROTES (#) + date/heure de fermeture dans l'historique.
+ *
+ *  HISTORIQUE 3.13d - CADRE R  (+ plafond de risque $ : le levier s'ajuste a la volatilite)
  *  ------------------------------------------------------------
  *  UN decret Calvin du 01/08, fix de la faille revelee par les 25 trades reels :
  *  PLAFOND DE RISQUE : mise x levier x 1R <= 1.2% du capital.
@@ -237,6 +259,7 @@
 'use strict';
 
 const http = require('http');
+const fs = require('fs'); // 3.13e : persistance state.json
 const crypto = require('crypto');
 const WebSocket = require('ws');
 
@@ -344,6 +367,13 @@ const STRAT = {
   ],
   ATR_MOD_LO: 0.006, ATR_MOD_HI: 0.029, // bornes de modulation ATR dans la fourchette du palier
   RISK_CAP_PCT: 0.012,  // 3.13d : plafond de risque par trade = mise x levier x 1R <= 1.2% du capital
+  // --- 3.13e MODE VOLATIL (decret 08/08, backtest bimodal valide) ---
+  VOL_R_PCT: 0.05,        // seuil : 1R > 5% du prix => mode volatil
+  VOL_PARTIAL_AT_R: 0.4,  // partiel des +0.4R (encaisse les +3-5% frequents)
+  VOL_PARTIAL_FRAC: 0.6,  // 60% encaisses au partiel
+  VOL_STOP_R: 0.6,        // stop initial -0.6R (on ne laisse pas courir -13%)
+  VOL_TRAIL_R: 0.25,      // TP suiveur serre apres partiel
+  PRICE_STALE_MS: 15000,  // 3.13e : prix plus vieux que 15s = gele -> pas de decision logicielle
   TP_SOFT_CAP: 0.35,    // borne haute indicative +35% (securite, rarement atteinte)
   // Time-stop CONDITIONNEL (Option B) :
   //  - trade qui STAGNE (trailing jamais armé) -> fermé à 2h30 (libère le capital)
@@ -528,6 +558,7 @@ function resetState(keepLog) {
   state.maxDrawdown = 0;
   state.killed = false;
   state.trades = [];
+  state.tradeSeq = 0; // 3.13e : numerotation des trades (#N, persiste)
   state.stats = { wins: 0, losses: 0, gross: 0, fees: 0, net: 0 };
   state.bonusStats = { wins: 0, losses: 0, net: 0, count: 0 };
   state.lastBonusAt = 0;
@@ -1244,6 +1275,53 @@ function releaseEntry(stake) {
   state._resStake = Math.max(0, (state._resStake || 0) - stake);
 }
 
+// ================== 3.13e : PERSISTANCE state.json ==================
+// Capital, stats, historique et compteur survivent aux redemarrages du process.
+// Ecriture atomique (tmp+rename), rechargement au boot si MODE identique.
+// NaN-guard sur tout ce qui est numerique (pattern TIME_OFFSET).
+const STATE_FILE = './state.json';
+function saveState() {
+  try {
+    const snap = {
+      v: '3.13e', mode: MODE, savedAt: Date.now(),
+      capital: state.capital, peakCapital: state.peakCapital,
+      maxDrawdown: state.maxDrawdown, tradeSeq: state.tradeSeq || 0,
+      consecLosses: state.consecLosses || 0,
+      stats: state.stats, bonusStats: state.bonusStats,
+      trades: (state.trades || []).slice(0, 100),
+    };
+    fs.writeFileSync(STATE_FILE + '.tmp', JSON.stringify(snap));
+    fs.renameSync(STATE_FILE + '.tmp', STATE_FILE);
+  } catch (e) { /* disque indisponible : non bloquant */ }
+}
+function loadState() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) return false;
+    const d = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    if (!d || d.mode !== MODE) return false; // testnet/mainnet : jamais melanges
+    const num = (x, fb) => (Number.isFinite(x) ? x : fb);
+    state.capital = num(d.capital, state.capital);
+    state.peakCapital = num(d.peakCapital, state.peakCapital);
+    state.maxDrawdown = num(d.maxDrawdown, 0);
+    state.tradeSeq = num(d.tradeSeq, 0);
+    state.consecLosses = num(d.consecLosses, 0);
+    if (d.stats) state.stats = d.stats;
+    if (d.bonusStats) state.bonusStats = d.bonusStats;
+    if (Array.isArray(d.trades)) state.trades = d.trades.slice(0, 100);
+    logLine(`\u{1F4BE} État restauré depuis state.json — capital $${state.capital.toFixed(2)}, ${state.trades.length} trades, compteur #${state.tradeSeq}.`);
+    return true;
+  } catch (e) { return false; }
+}
+
+// 3.13e : LOG DE REFUS throttle (10 min / symbole) — le bot dit pourquoi il n'entre pas.
+function logSkip(S, symbol, msg) {
+  const now = Date.now();
+  if (!S._skipLogAt || now - S._skipLogAt > 600000) {
+    S._skipLogAt = now;
+    logLine(`\u23ED\uFE0F ${symbol} sauté : ${msg}`);
+  }
+}
+
 function currentExposure() {
   let total = 0;
   for (const s of ALL_SYMBOLS) if (state.sym[s].position) total += state.sym[s].position.stake;
@@ -1403,8 +1481,16 @@ async function tryOpen(symbol, signal) {
   // 3.13a GARDE FRICTION : si 1R (stop ATR) ne vaut pas au moins 6x les frais
   // aller-retour, le trade est un pile-ou-face a esperance negative (57% des
   // trades reels vivaient sous 0.5% de mouvement : 2/23 gagnants). On skip.
+  // 3.13e GARDE FRAICHEUR : prix gele (WS silencieux > 15s) -> aucune entree.
+  if (!S.priceAt || Date.now() - S.priceAt > STRAT.PRICE_STALE_MS) {
+    logSkip(S, symbol, `prix gelé depuis ${S.priceAt ? Math.round((Date.now() - S.priceAt) / 1000) : '?'}s — entrée refusée`);
+    return;
+  }
   const exitsPre = computeExits(symbol);
-  if (exitsPre.rPct < STRAT.FRICTION_MIN_R * STRAT.FRICTION_RT) return;
+  if (exitsPre.rPct < STRAT.FRICTION_MIN_R * STRAT.FRICTION_RT) {
+    logSkip(S, symbol, `friction (1R ${(exitsPre.rPct * 100).toFixed(2)}% < ${STRAT.FRICTION_MIN_R}× frais ${(STRAT.FRICTION_RT * 100).toFixed(2)}%)`);
+    return;
+  }
 
   // 3.13d PLAFOND DE RISQUE $ (decret 01/08) : mise x levier x 1R <= 1.2% du
   // capital. Les paliers fixent la mise ; le LEVIER s'ajuste a la volatilite.
@@ -1413,7 +1499,10 @@ async function tryOpen(symbol, signal) {
   if (!signal.bonus) {
     const riskCap = state.capital * STRAT.RISK_CAP_PCT;
     while (lev > 1 && stake * lev * exitsPre.rPct > riskCap) lev--;
-    if (stake * lev * exitsPre.rPct > riskCap) return; // meme x1 depasse -> pas de trade
+    if (stake * lev * exitsPre.rPct > riskCap) {
+      logSkip(S, symbol, `plafond risque (1R ${(exitsPre.rPct * 100).toFixed(1)}% × mise ${stake}$ = ${(stake * exitsPre.rPct).toFixed(1)}$ > ${riskCap.toFixed(1)}$ même à ×1)`);
+      return;
+    }
   }
 
   // 3.13b PRIORITE Q : a signaux simultanes (typique au boot), le meilleur Q
@@ -1537,9 +1626,15 @@ async function tryOpen(symbol, signal) {
   const exits = computeExits(symbol);
   S.position = {
     side: signal.side, entry, qty, stake, lev, quality: signal.quality,
-    entryFill, slPct: exits.slPct, tpPct: exits.tpPct,
+    entryFill,
+    // 3.13e MODE VOLATIL : 1R > 5% -> stop initial ressere a -0.6R (natif inclus).
+    volMode: exits.rPct > STRAT.VOL_R_PCT,
+    slPct: (exits.rPct > STRAT.VOL_R_PCT) ? exits.rPct * STRAT.VOL_STOP_R : exits.slPct,
+    tpPct: exits.tpPct,
     rPct: exits.rPct, partialDone: false, // 3.13a cadre R
-    sl: signal.side === 'BUY' ? entry * (1 - exits.slPct) : entry * (1 + exits.slPct),
+    sl: signal.side === 'BUY'
+      ? entry * (1 - ((exits.rPct > STRAT.VOL_R_PCT) ? exits.rPct * STRAT.VOL_STOP_R : exits.slPct))
+      : entry * (1 + ((exits.rPct > STRAT.VOL_R_PCT) ? exits.rPct * STRAT.VOL_STOP_R : exits.slPct)),
     tp: signal.side === 'BUY' ? entry * (1 + exits.tpPct) : entry * (1 - exits.tpPct),
     openedAt: now, peakPnl: 0, scaleDone: [],
   };
@@ -1665,13 +1760,16 @@ async function closePos(symbol, reason, qtyToClose = null) {
   const dd = (state.peakCapital - state.capital) / state.peakCapital;
   if (dd > state.maxDrawdown) state.maxDrawdown = dd;
 
+  state.tradeSeq = (state.tradeSeq || 0) + 1; // 3.13e : numerotation
   state.trades.unshift({
+    n: state.tradeSeq, closedAt: Date.now(),
     symbol, side: pos.side, entry: pos.entry, exit, lev: pos.lev, quality: pos.quality,
     investi: pos.stake.toFixed(2), pnlPct: (pnlPct * 100).toFixed(2),
     gross: gross.toFixed(2), fees: fees.toFixed(2), net: net.toFixed(2),
     reason, durationMs: Date.now() - pos.openedAt,
   });
   if (state.trades.length > 100) state.trades.pop();
+  try { saveState(); } catch (e) {} // 3.13e : persistance a chaque cloture
 
   const rMult = (pos.rPct && pos.rPct > 0) ? (pnlPct / pos.rPct) : null; // 3.13a journal en R
   logLine(`🔴 ${symbol} ${reason} @ ${exit.toFixed(4)} | ${rMult != null ? (rMult >= 0 ? '+' : '') + rMult.toFixed(2) + 'R | ' : ''}net=${net.toFixed(2)}$ | capital=${state.capital.toFixed(2)}$`);
@@ -1762,928 +1860,4 @@ async function placeExchangeStops(symbol) {
       // les vieux environnements testnet pre-migration.
       try {
         await signedRequest('POST', '/fapi/v1/order', {
-          symbol, side: closeSide, type: orderType, stopPrice: triggerPrice,
-          closePosition: 'true', workingType: 'MARK_PRICE',
-        });
-        logLine(`\u{1F6E1}\uFE0F ${symbol} ${orderType} NATIF posé sur Binance @ ${triggerPrice} (v1 legacy)`);
-        return true;
-      } catch (e2) {
-        logLine(`\u26A0\uFE0F ${symbol} ${orderType} natif non posé (algo: ${e1.binanceCode || e1.message} / v1: ${e2.binanceCode || e2.message}) — SL logiciel actif en secours.`);
-        return false;
-      }
-    }
-  };
-  // 3.13c : SL et TP poses en PARALLELE (~150-300ms gagnes ; protection complete plus tot).
-  const jobs = [placeNative('STOP_MARKET', slPrice)];
-  if (!pos.bonus) jobs.push(placeNative('TAKE_PROFIT_MARKET', tpPrice));
-  const results = await Promise.all(jobs);
-  let ok = results.filter(Boolean).length;
-  pos.exchangeStops = ok > 0; // true seulement si au moins le SL est posé côté Binance
-  if (ok) pos.exchangeSlPrice = slPrice;
-  return ok;
-}
-
-function managePosition(symbol) {
-  const S = state.sym[symbol];
-  const pos = S.position;
-  if (!pos) return;
-  if (pos.closing) return; // une fermeture est déjà en cours : ne pas empiler d'ordres
-  const px = S.price;
-  const dir = pos.side === 'BUY' ? 1 : -1;
-  const pnlPct = ((px - pos.entry) / pos.entry) * dir;
-  const age = Date.now() - pos.openedAt;
-
-  // Pic de profit (pour le trailing)
-  if (pos.peakPnl == null || pnlPct > pos.peakPnl) pos.peakPnl = pnlPct;
-
-  // BONUS LOTERIE (3.12g, decret Calvin 26/07) : SL -5% PRIX (natif + logiciel en secours).
-  // Le trailing s'arme quand le gain atteint +100% de la mise, puis laisse courir
-  // (ferme quand le gain rend 30% de son pic). Pas de time-stop.
-  if (pos.bonus) {
-    // 0) STOP-LOSS -5% : coupe AVANT le trou sans fond du cross-margin
-    //    (constate le 26/07 : EUL -18.6% de prix = -2.8x la mise, sans liquidation).
-    if (pnlPct <= -(pos.slPct || STRAT.BONUS_SL_PCT)) { closePos(symbol, 'BONUS-SL'); return; }
-    const stakeGain = pnlPct * pos.lev; // gain en fraction de la mise (prix * levier)
-    if (pos.bonusPeakGain == null || stakeGain > pos.bonusPeakGain) pos.bonusPeakGain = stakeGain;
-    if (pos.bonusPeakGain >= STRAT.BONUS_TP_ARM_STAKE) {
-      pos.bonusArmed = true; // doublement atteint -> trailing actif
-      if (stakeGain <= pos.bonusPeakGain * (1 - STRAT.BONUS_TRAIL_GIVEBACK)) { closePos(symbol, 'BONUS-TRAIL'); return; }
-    }
-    return; // au-dessus du SL et non arme : on laisse vivre
-  }
-
-  // ================= 3.13a CADRE R =================
-  const rPct = pos.rPct || pos.slPct; // 1R fige a l'ouverture (ATR) ; fallback ancien SL
-
-  // 1) STOP -1R : la these est invalidee. Perte = exactement 1R, partout.
-  if (!pos.partialDone && pnlPct <= -pos.slPct) { closePos(symbol, 'STOP-1R'); return; }
-
-  // 2) PARTIEL a +1R : encaisse PARTIAL_FRAC, stop du reste au BREAK-EVEN (+frais).
-  //    A partir d'ici la position ne peut mathematiquement plus finir perdante.
-  if (!pos.partialDone && pnlPct >= STRAT.PARTIAL_AT_R * rPct && pos.qty > 0) {
-    const chunk = roundQty(symbol, pos.qty * STRAT.PARTIAL_FRAC);
-    if (chunk > 0 && chunk < pos.qty) {
-      pos.partialDone = true;
-      pos.beFloor = STRAT.FEE_MAKER + STRAT.FEE_TAKER; // plancher : entree + frais
-      closePos(symbol, 'PARTIEL+1R', chunk);
-      // Stop natif Binance redeploye au break-even (asynchrone, non bloquant) :
-      // meme bot eteint, le reste de la position ne peut plus perdre.
-      pos.sl = pos.side === 'BUY' ? pos.entry * (1 + pos.beFloor) : pos.entry * (1 - pos.beFloor);
-      placeExchangeStops(symbol).catch(() => {});
-      return;
-    }
-  }
-
-  // 3) Apres partiel : plancher = max(break-even, pic - TRAIL_R x R).
-  if (pos.partialDone) {
-    const floor = Math.max(pos.beFloor || 0, (pos.peakPnl || 0) - STRAT.TRAIL_R * rPct);
-    if (pnlPct <= floor) {
-      closePos(symbol, pnlPct > (pos.beFloor || 0) + 1e-9 ? 'TRAIL-R' : 'BREAK-EVEN');
-      return;
-    }
-  }
-
-  // 4) Borne haute de sécurité (rarement atteinte)
-  if (pnlPct >= STRAT.TP_SOFT_CAP) { closePos(symbol, 'TAKE-PROFIT'); return; }
-  // Time-stop révisé (backtest) : le time-stop "stagnant" est DÉSACTIVÉ (0 = le SL seul gère) ;
-  // un trade qui travaille (trailing armé) est borné à 24h pour laisser courir les gagnants.
-  const trailingArmed = pos.partialDone === true; // 3.13a : "travaille" = partiel pris
-  const timeLimit = trailingArmed ? STRAT.TIME_STOP_WORKING_MS : STRAT.TIME_STOP_STALE_MS;
-  // timeLimit=0 -> time-stop DÉSACTIVÉ pour cet état (le trade n'est pas coupé par le temps).
-  if (timeLimit > 0 && age >= timeLimit) { closePos(symbol, trailingArmed ? 'TIME-STOP-24H' : 'TIME-STOP-STALE'); return; }
-
-  // Affichage fluide : pousse le P&L live des positions au dashboard (throttle 2s global).
-  // Seulement si un dashboard est connecte : sinon on ne construit meme pas la liste.
-  if (clients.size) {
-    const nowMs = Date.now();
-    if (!state._lastPosBroadcast || nowMs - state._lastPosBroadcast > 2000) {
-      state._lastPosBroadcast = nowMs;
-      broadcast({ type: 'positions', positions: livePositions() });
-    }
-  }
-}
-
-// ==================================================================
-// BOUCLE PAR TICK
-// ==================================================================
-async function symbolTick(symbol) {
-  const S = state.sym[symbol];
-  if (!state.running || S.price <= 0) return;
-  // GESTION DES SORTIES : à chaque tick (vital, une position doit réagir vite au stop).
-  managePosition(symbol);
-  if (S.busy || S.position || S.disabled) return;
-  // DÉTECTION D'ENTRÉE : throttlée à ~1s par symbole. Sur horizon swing 1h, évaluer le
-  // signal 28x/s serait du gaspillage CPU pur — 1x/s est rigoureusement équivalent en
-  // résultat. Le recalcul live des indicateurs est intégré ici (même cadence).
-  const now = Date.now();
-  if (S._detectAt && now - S._detectAt < 1000) return;
-  S._detectAt = now;
-  refreshLiveIndicators(S); // bandes/RSI réactifs au prix courant
-  let signal = computeSignal(symbol);
-  // BONUS LOTERIE (3.12h, decret Calvin) : 1x/heure, reserve aux signaux d'ELITE
-  // (Q >= BONUS_MIN_Q=70, etait 50) — moins de tickets, mieux choisis.
-  if (signal && !signal.filler && STRAT.BONUS_ENABLED && signal.quality >= STRAT.BONUS_MIN_Q &&
-      (Date.now() - state.lastBonusAt) >= STRAT.BONUS_INTERVAL_MS) {
-    // 3.12j (decret Calvin 30/07) : verrou RESERVE ICI, avant tout await —
-    // pose a l'ouverture, plusieurs symboles passaient le test simultanement.
-    state.lastBonusAt = Date.now();
-    signal = { ...signal, bonus: true };
-  }
-  // PLANCHER : pas de signal normal ET moins de 4 entrées dans l'heure -> tenter un
-  // COMBLEMENT (seuils élargis +15% add., mise bridée). Jamais d'entrée sans signal.
-  if (!signal && STRAT.FLOOR_ENABLED && tradesLastHour() < STRAT.MIN_TRADES_PER_HOUR) {
-    const relaxed = computeSignal(symbol, STRAT.FILLER_RELAX_ADD);
-    if (relaxed && relaxed.quality >= STRAT.FILLER_MIN_QUALITY) signal = { ...relaxed, filler: true };
-  }
-  if (signal) {
-    S.busy = true;
-    try { await tryOpen(symbol, signal); }
-    finally { S.busy = false; }
-  }
-}
-
-async function reconcile() {
-  if (!API_KEY || !API_SECRET) return;
-  if (reconcile._busy) return; // idem : un seul cycle de réconciliation à la fois
-  reconcile._busy = true;
-  try {
-    // UN SEUL appel : toutes les positions réelles du compte (source de vérité).
-    const data = await signedRequest('GET', '/fapi/v2/positionRisk', {});
-    if (!Array.isArray(data)) return;
-
-    // Index des positions réelles non nulles.
-    const real = {};
-    for (const p of data) {
-      const amt = parseFloat(p.positionAmt);
-      const step = SYMBOL_INFO[p.symbol] ? SYMBOL_INFO[p.symbol].stepSize : 0.000001;
-      if (Math.abs(amt) >= step) {
-        real[p.symbol] = {
-          side: amt > 0 ? 'BUY' : 'SELL',
-          qty: Math.abs(amt),
-          entry: parseFloat(p.entryPrice),
-          lev: parseFloat(p.leverage) || STRAT.LEV_MAX,
-        };
-      }
-    }
-
-    // 1) Positions FANTÔMES : l'état interne dit "ouvert", Binance dit "fermé" -> on nettoie.
-    for (const symbol of Object.keys(state.sym)) {
-      const S = state.sym[symbol];
-      if (S.position && S.position.closingManual) continue; // fermeture manuelle en cours
-      // 3.12h : fermeture LOGICIELLE en cours -> closePos comptabilisera lui-meme.
-      // Garde ANTI-DOUBLE-COMPTAGE (doublon 'SL/TP NATIF'+'TRAILING' constate le 26/07).
-      if (S.position && S.position.closing) continue;
-      if (S.position && !real[symbol]) {
-        // Position fermée cote Binance (par le SL/TP NATIF, un stop manuel Binance, ou
-        // une liquidation) alors que le bot ne l'a pas fermee lui-meme -> on COMPTABILISE
-        // le P&L realise (au dernier prix connu) pour que les stats restent justes, puis
-        // on nettoie. Sans ca, les trades fermes par ordre natif seraient invisibles.
-        const pos = S.position;
-        const exitPx = S.price || pos.sl || pos.entry;
-        const dir = pos.side === 'BUY' ? 1 : -1;
-        const pnlPct = ((exitPx - pos.entry) / pos.entry) * dir;
-        const gross = pnlPct * pos.stake * pos.lev;
-        const fees = pos.stake * pos.lev * (STRAT.FEE_MAKER + STRAT.FEE_TAKER);
-        const net = gross - fees;
-        state.capital += net;
-        state.stats.gross += gross; state.stats.fees += fees; state.stats.net += net;
-        if (net >= 0) { state.stats.wins++; state.consecLosses = 0; } else { state.stats.losses++; state.consecLosses++; }
-        if (pos.bonus) { // 3.12h : les fermetures natives alimentent AUSSI le compteur separe du bonus
-          state.bonusStats.count++; state.bonusStats.net += net;
-          if (net >= 0) state.bonusStats.wins++; else state.bonusStats.losses++;
-        }
-        if (state.capital > state.peakCapital) state.peakCapital = state.capital;
-        const ddNat = (state.peakCapital - state.capital) / state.peakCapital;
-        if (ddNat > state.maxDrawdown) state.maxDrawdown = ddNat;
-        // 3.12h : MEME format de ligne que closePos — fini le $NaN (champ investi
-        // manquant) et le pourcentage brut a 16 decimales dans l'historique.
-        const investiNat = (pos.stake || ((pos.qty * pos.entry) / (pos.lev || 1)) || 0);
-        state.trades.unshift({ symbol, side: pos.side, lev: pos.lev, entry: pos.entry,
-          exit: exitPx, quality: pos.quality, investi: investiNat.toFixed(2),
-          pnlPct: (pnlPct * 100).toFixed(2), gross: gross.toFixed(2), fees: fees.toFixed(2),
-          net: net.toFixed(2), reason: pos.bonus ? 'BONUS-SL NATIF' : 'SL/TP NATIF',
-          at: Date.now(), durationMs: Date.now() - (pos.openedAt || Date.now()) });
-        if (state.trades.length > 100) state.trades.pop();
-        S.position = null;
-        logLine(`🛡️ ${symbol} : fermé par ordre natif Binance (SL/TP) — net ${net.toFixed(2)}$ comptabilisé.`);
-      }
-    }
-
-    // 2) Positions ORPHELINES : Binance a une position que l'état interne ignore -> on l'ADOPTE.
-    //    (C'est LE correctif : le bot reprend la main sur des positions qu'il ne suivait plus,
-    //    pour les gérer — stop, trailing, scaling out — au lieu de les laisser flotter.)
-    for (const symbol of Object.keys(real)) {
-      ensureSymbolState(symbol);
-      const S = state.sym[symbol];
-      const r = real[symbol];
-      if (S.position && S.position.closingManual) continue; // fermeture manuelle en cours
-      if (!S.position) {
-        const exits = computeExits(symbol);
-        // On estime la mise à partir de la marge réelle (qty*entry/levier).
-        const stake = (r.qty * r.entry) / (r.lev || 1);
-        S.position = {
-          side: r.side, entry: r.entry, qty: r.qty, stake, lev: r.lev,
-          quality: 0, entryFill: 'taker',
-          slPct: exits.slPct, tpPct: exits.tpPct,
-          rPct: exits.rPct, partialDone: false, // 3.13a cadre R (adoption)
-          sl: r.side === 'BUY' ? r.entry * (1 - exits.slPct) : r.entry * (1 + exits.slPct),
-          tp: r.side === 'BUY' ? r.entry * (1 + exits.tpPct) : r.entry * (1 - exits.tpPct),
-          openedAt: Date.now(), peakPnl: 0, scaleDone: [], adopted: true,
-        };
-        // S'assurer que le symbole est surveillé (flux prix) même hors univers courant.
-        if (!ALL_SYMBOLS.includes(symbol)) { ALL_SYMBOLS.push(symbol); reconnectPriceStreamsSoon(); }
-        logLine(`🩹 ${symbol} : position réelle ADOPTÉE (${r.side} ${r.qty} @ ${r.entry}, x${r.lev}) — désormais gérée.`);
-        // 3.12f : protection IMMEDIATE — le SL -4.5% + TP natifs sont poses sur Binance
-        // des l'adoption (avant, seule la boucle logicielle couvrait la position).
-        try { await placeExchangeStops(symbol); } catch (e) { logLine(`\u26A0\uFE0F ${symbol} stops natifs post-adoption: ${e.message}`); }
-      } else {
-        // Position connue : on resynchronise qty/entry sur la réalité Binance.
-        S.position.qty = r.qty;
-        S.position.entry = r.entry;
-      }
-    }
-    if (clients.size) broadcast({ type: 'positions', positions: livePositions() });
-  } catch (e) {
-    logLine(`⚠️ reconcile: ${e.message}`);
-  } finally { reconcile._busy = false; }
-}
-
-// Reconnexion du flux prix (débounce léger) quand l'univers change via adoption.
-let _reconnectTimer = null;
-function reconnectPriceStreamsSoon() {
-  if (_reconnectTimer) return;
-  _reconnectTimer = setTimeout(() => {
-    _reconnectTimer = null;
-    if (priceWs) { const old = priceWs; priceWs = null; try { old.close(); } catch (e) {} connectPriceStreams(); }
-  }, 2000);
-}
-
-// ==================================================================
-// WEBSOCKET PRIX (multi-stream)
-// ==================================================================
-let priceWs = null;
-// MIGRATION BINANCE 06/03/2026 : les WebSocket Futures sont scindes en routes
-// /public, /market, /private ; les URL legacy (sans route) sont RETIREES depuis
-// le 23/04/2026 — la connexion s'ouvre mais @markPrice (route /market) ne pousse
-// PLUS RIEN (mutisme silencieux, aucun message d'erreur). On vise /market en
-// premier, avec un WATCHDOG : 25s sans prix -> bascule de route + reconnexion
-// (auto-reparation si le testnet/demo ou une future migration differe).
-// ================== 3.13c : USER DATA STREAM (reactivite pure) ==================
-// Flux WebSocket PRIVE Binance : ORDER_TRADE_UPDATE / ACCOUNT_UPDATE pousses en
-// ~50ms des qu'un ordre s'execute (stops natifs algoOrder inclus). On ne duplique
-// AUCUNE comptabilite : on declenche juste la reconciliation existante (Binance =
-// source de verite) immediatement, avec un debounce 300ms. Le cycle 9s reste en filet.
-let userWs = null, _listenKey = null, _lkTimer = null, _fastReconTimer = null;
-function scheduleFastReconcile() {
-  if (_fastReconTimer) return;
-  _fastReconTimer = setTimeout(() => {
-    _fastReconTimer = null;
-    try { const p = reconcile(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
-  }, 300);
-}
-async function startUserDataStream() {
-  if (!API_KEY || !API_SECRET) return; // lecture seule : rien a ecouter
-  try {
-    if (userWs) { const o = userWs; userWs = null; try { o.close(); } catch (e) {} }
-    if (_lkTimer) { clearInterval(_lkTimer); _lkTimer = null; }
-    const r = await signedRequest('POST', '/fapi/v1/listenKey', {});
-    _listenKey = r && r.listenKey;
-    if (!_listenKey) return;
-    // Keepalive : Binance expire la listenKey apres 60 min sans PUT -> PUT / 30 min.
-    _lkTimer = setInterval(() => { try { const p = signedRequest('PUT', '/fapi/v1/listenKey', {}); if (p && p.catch) p.catch(() => {}); } catch (e) {} }, 1800000);
-    const ws = new WebSocket(`${WS_BASE}/ws/${_listenKey}`);
-    userWs = ws;
-    ws.on('open', () => logLine('\u{1F50C} User Data Stream connecté — exécutions poussées en ~50ms (réconciliation 9s en filet).'));
-    ws.on('message', (raw) => {
-      try {
-        const m = JSON.parse(raw);
-        const ev = m.e || (m.data && m.data.e);
-        if (ev === 'ORDER_TRADE_UPDATE' || ev === 'ACCOUNT_UPDATE') scheduleFastReconcile();
-        else if (ev === 'listenKeyExpired') { logLine('\u26A0\uFE0F listenKey expirée — renouvellement du User Data Stream.'); startUserDataStream(); }
-      } catch (e) { /* ignore */ }
-    });
-    ws.on('close', () => { if (userWs === ws) { userWs = null; setTimeout(startUserDataStream, 3000); } });
-    ws.on('error', () => { /* le close ci-dessus gere la reconnexion */ });
-  } catch (e) { /* non bloquant : la reconciliation 9s couvre tout */ }
-}
-
-const WS_ROUTES = ['/market', ''];
-let _wsRouteIdx = 0;
-function connectPriceStreams() {
-  if (!ALL_SYMBOLS.length) { setTimeout(connectPriceStreams, 2000); return; }
-  const route = WS_ROUTES[_wsRouteIdx % WS_ROUTES.length];
-  // 3.13c : + @bookTicker par symbole -> bid/ask en continu (garde-fou carnet a 0ms).
-  const streams = ALL_SYMBOLS.map((s) => `${s.toLowerCase()}@markPrice@1s/${s.toLowerCase()}@bookTicker`).join('/');
-  const url = `${WS_BASE}${route}/stream?streams=${streams}`;
-  const ws = new WebSocket(url);
-  priceWs = ws;
-  ws._gotData = false;
-  ws.on('open', () => {
-    logLine(`🔌 WebSocket prix connecté (${MODE} · route ${route || 'legacy'}) — ${ALL_SYMBOLS.length} symboles`);
-    setTimeout(() => {
-      if (priceWs === ws && !ws._gotData) {
-        _wsRouteIdx++;
-        const next = WS_ROUTES[_wsRouteIdx % WS_ROUTES.length] || 'legacy';
-        logLine(`⚠️ Flux prix MUET (25s sans message sur ${route || 'legacy'}) — bascule route ${next} + reconnexion.`);
-        priceWs = null; try { ws.close(); } catch (e) {}
-        connectPriceStreams();
-      }
-    }, 25000);
-  });
-  ws.on('message', (raw) => {
-    ws._gotData = true;
-    try {
-      const msg = JSON.parse(raw);
-      const d = msg.data || msg;
-      const sym = (d.s || '').toUpperCase();
-      // 3.13c : evenement bookTicker -> mise a jour du carnet en memoire, pas un tick prix.
-      if (d.e === 'bookTicker' && sym && state.sym[sym]) {
-        const bid = parseFloat(d.b), ask = parseFloat(d.a), mid = (bid + ask) / 2;
-        if (bid > 0 && ask > 0 && mid > 0) state.sym[sym].book = { bid, ask, spreadPct: (ask - bid) / mid, at: Date.now() };
-        return;
-      }
-      const p = parseFloat(d.p || d.markPrice);
-      if (sym && state.sym[sym] && p > 0) {
-        const S = state.sym[sym];
-        S.price = p;
-        // Buffer circulaire (évite shift() O(n) répété à chaque tick).
-        if (!S.priceBuf) { S.priceBuf = new Array(60).fill(p); S.priceBufIdx = 0; }
-        S.priceBuf[S.priceBufIdx] = p;
-        S.priceBufIdx = (S.priceBufIdx + 1) % S.priceBuf.length;
-        symbolTick(sym);
-      }
-    } catch (e) { /* ignore */ }
-  });
-  ws.on('close', () => { if (priceWs === ws) { logLine('⚠️ WS prix fermé — reconnexion 3s'); setTimeout(connectPriceStreams, 3000); } });
-  ws.on('error', (e) => logLine(`⚠️ WS error: ${e.message}`));
-}
-
-// Applique un nouvel univers : met à jour ALL_SYMBOLS, initialise les états,
-// et reconnecte le flux de prix. Appelé au démarrage et à chaque re-scan.
-async function applyUniverse(symbols) {
-  const changed = symbols.slice().sort().join(',') !== ALL_SYMBOLS.slice().sort().join(',');
-  ALL_SYMBOLS = symbols;
-  state.universe = symbols;
-  for (const s of symbols) ensureSymbolState(s);
-  if (changed && priceWs) {
-    const old = priceWs; priceWs = null;
-    try { old.close(); } catch (e) {}
-    connectPriceStreams();
-  }
-  logLine(`🌍 Univers : ${symbols.length} cryptos les plus volatiles — ${symbols.slice(0, 8).join(', ')}...`);
-}
-
-// Re-scan périodique de l'univers volatil.
-async function refreshUniverse() {
-  const top = await scanUniverse();
-  await applyUniverse(top);
-}
-
-async function refreshAllKlines() {
-  if (refreshAllKlines._busy) return; // ne pas empiler si le cycle précédent n'est pas fini (réseau lent)
-  refreshAllKlines._busy = true;
-  try {
-  // Carnets d'ordres RÉELS (bid/ask) de tous les symboles en UN appel (poids 5).
-  // Sert de filtre de tradabilité : spread énorme ou carnet vide = actif bloqué.
-  try {
-    const books = await publicGet(REST_BASE, '/fapi/v1/ticker/bookTicker', {});
-    for (const b of (Array.isArray(books) ? books : [])) {
-      const S = state.sym[b.symbol]; if (!S) continue;
-      const bid = +b.bidPrice, ask = +b.askPrice, mid = (bid + ask) / 2;
-      S.book = { bid, ask, spreadPct: (bid > 0 && ask > 0 && mid > 0) ? (ask - bid) / mid : Infinity, at: Date.now() };
-    }
-  } catch (e) { /* silencieux : prochain cycle */ }
-  const BATCH = 4;
-  for (let i = 0; i < ALL_SYMBOLS.length; i += BATCH) {
-    const slice = ALL_SYMBOLS.slice(i, i + BATCH);
-    await Promise.all(slice.map((s) => refreshKlines(s)));
-  }
-  rankActiveSymbols();
-  if (clients.size) broadcast({ type: 'snapshot', data: snapshot() }); // snapshot construit seulement s'il y a un spectateur
-  } finally { refreshAllKlines._busy = false; }
-}
-
-// Tous les symboles de l'univers (déjà filtré volatilité + liquidité 100M+spread) sont tradables ;
-// le filtrage fin (régime, extrêmes, funding) se fait dans computeSignal.
-function rankActiveSymbols() {
-  // L'univers est déjà les N plus volatils ; tous sont actifs. Le filtrage fin
-  // (régime, extrême, funding) se fait dans computeSignal.
-  state.activeSymbols = ALL_SYMBOLS.slice();
-}
-
-// ==================================================================
-// SERVEUR HTTP + WS DASHBOARD
-// ==================================================================
-const clients = new Set();
-function broadcast(obj) {
-  if (clients.size === 0) return; // personne ne regarde -> zero serialisation, zero envoi
-  const msg = JSON.stringify(obj);
-  for (const c of clients) if (c.readyState === WebSocket.OPEN) c.send(msg);
-}
-
-function livePositions() {
-  const out = [];
-  for (const symbol of ALL_SYMBOLS) {
-    const S = state.sym[symbol];
-    const pos = S.position;
-    if (!pos) continue;
-    const px = S.price || pos.entry;
-    const dir = pos.side === 'BUY' ? 1 : -1;
-    const pnlPct = ((px - pos.entry) / pos.entry) * dir;
-    const gross = pnlPct * pos.stake * pos.lev;
-    const fees = pos.stake * pos.lev * (STRAT.FEE_MAKER + STRAT.FEE_TAKER);
-    out.push({
-      symbol, side: pos.side, entry: pos.entry, current: px, lev: pos.lev,
-      quality: pos.quality, investi: pos.stake, sl: pos.sl, tp: pos.tp,
-      pnlPct: pnlPct * 100, netLive: gross - fees,
-      ageMs: Date.now() - (pos.openedAt || Date.now()), timeStopMs: (pos.peakPnl != null && pos.peakPnl >= STRAT.TRAIL_ARM) ? STRAT.TIME_STOP_WORKING_MS : (STRAT.TIME_STOP_STALE_MS || STRAT.TIME_STOP_WORKING_MS),
-      adopted: !!pos.adopted,
-    });
-  }
-  return out;
-}
-
-function symbolsOverview() {
-  return ALL_SYMBOLS.map((symbol) => {
-    const S = state.sym[symbol];
-    // Reconstitue la mini-courbe (40 pts) depuis le buffer circulaire, dans l'ordre.
-    const spark = [];
-    if (S.priceBuf) {
-      const n = S.priceBuf.length;
-      const take = Math.min(40, n);
-      // Directement les `take` points les plus recents, en ordre chronologique :
-      // strictement identique a l'ancienne reconstruction complete + slice(-40).
-      for (let i = n - take; i < n; i++) spark.push(S.priceBuf[(S.priceBufIdx + i) % n]);
-    }
-    return {
-      symbol, price: S.price, bias: S.indicators.bias, quality: S.indicators.quality,
-      rsi: S.indicators.rsi, regime: S.swing.regime, adx: S.swing.adx, funding: S.swing.funding, hasPosition: !!S.position,
-      disabled: !!S.disabled,
-      illiquid: !!(S.book && S.book.spreadPct > STRAT.BOOK_MAX_SPREAD_PCT),
-      spark,
-    };
-  });
-}
-
-function snapshot() {
-  const tot = state.stats.wins + state.stats.losses;
-  return {
-    mode: state.mode, running: state.running, killed: state.killed,
-    connected: !!(API_KEY && API_SECRET), keyPrefix: API_KEY ? API_KEY.slice(0, 8) : null,
-    capital: state.capital, capitalStart: state.capitalStart,
-    maxDrawdown: state.maxDrawdown * 100,
-    exposure: currentExposure(), maxExposure: state.capital * STRAT.MAX_EXPOSURE_PCT,
-    openPositions: openPositionsCount(),
-    maxPositions: STRAT.MAX_POSITIONS_CAP,
-    wins: state.stats.wins, losses: state.stats.losses,
-    stats: state.stats, winRate: tot ? (state.stats.wins / tot) * 100 : null,
-    positions: livePositions(), symbols: symbolsOverview(),
-    trades: state.trades.slice(0, 40), log: state.log.slice(0, 50),
-    strat: { sl: STRAT.SL_PCT * 100, trailArm: STRAT.TRAIL_ARM * 100, trailPct: STRAT.TRAIL_PCT * 100, lev: '2-5', universe: state.universe.length, relaxOn: STRAT.RELAX_RANGE_ENTRY, floorOn: STRAT.FLOOR_ENABLED, bonusOn: STRAT.BONUS_ENABLED },
-    bonusStats: state.bonusStats,
-  };
-}
-
-const server = http.createServer((req, res) => {
-  if (req.url === '/' || req.url === '/dashboard') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(DASHBOARD_HTML);
-    return;
-  }
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, mode: MODE, running: state.running }));
-    return;
-  }
-  if (req.url === '/state') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(snapshot()));
-    return;
-  }
-  res.writeHead(404);
-  res.end('Not found');
-});
-
-// Filets de sécurité process : une promesse non gérée ou une exception isolée
-// est LOGGÉE au lieu de tuer le process en silence (Railway redémarrerait, mais
-// on perdrait le diagnostic et quelques secondes de gestion des positions).
-process.on('unhandledRejection', (e) => { try { logLine(`⚠️ Promesse non gérée : ${(e && e.message) || e}`); } catch (_) {} });
-process.on('uncaughtException', (e) => { try { logLine(`⚠️ Exception non capturée : ${e.message}`); } catch (_) {} });
-
-// Compression WS (permessage-deflate) : réduit ~70% la bande passante du
-// dashboard (JSON très compressible) — sensible sur mobile 4G/5G.
-const wss = new WebSocket.Server({ server, perMessageDeflate: true });
-wss.on('connection', (ws) => {
-  clients.add(ws);
-  ws.send(JSON.stringify({ type: 'snapshot', data: snapshot() }));
-  ws.on('message', async (raw) => {
-    let cmd;
-    try { cmd = JSON.parse(raw); } catch { return; }
-    if (cmd.action === 'start') {
-      if (state.killed) { logLine('⚠️ Kill switch actif — redémarrage refusé.'); return; }
-      state.running = true; logLine('▶️ Bot LANCÉ'); broadcast({ type: 'status', running: true });
-    } else if (cmd.action === 'stop') {
-      state.running = false; logLine('⏸️ Bot EN PAUSE'); broadcast({ type: 'status', running: false });
-    } else if (cmd.action === 'closeAll') {
-      for (const s of Object.keys(state.sym)) if (state.sym[s].position) await closePos(s, 'MANUEL');
-      logLine('🧹 Fermeture manuelle de TOUTES les positions');
-    } else if (cmd.action === 'closeManual') {
-      const sym = cmd.symbol;
-      const S = sym && state.sym[sym];
-      if (!S || !S.position) { logLine(`⚠️ closeManual: pas de position sur ${sym}`); return; }
-      const pct = cmd.pct != null ? Math.max(1, Math.min(100, parseFloat(cmd.pct))) : 100;
-      const qtyToClose = pct >= 100 ? null : roundQty(sym, S.position.qty * (pct / 100));
-      S.position.closingManual = true;
-      logLine(`👤 CLÔTURE MANUELLE ${sym} — ${pct}%`);
-      await closePos(sym, pct >= 100 ? 'MANUEL' : `MANUEL-${pct}%`, qtyToClose);
-      if (state.sym[sym] && state.sym[sym].position) state.sym[sym].position.closingManual = false;
-    } else if (cmd.action === 'toggleBonus') {
-      STRAT.BONUS_ENABLED = !STRAT.BONUS_ENABLED;
-      logLine(`🎰 Bonus loterie : ${STRAT.BONUS_ENABLED ? 'ACTIVÉ (25-50$, x9, SL -5%, TP+100% puis trailing)' : 'DÉSACTIVÉ'}`);
-      broadcast({ type: 'snapshot', data: snapshot() });
-    } else if (cmd.action === 'toggleFloor') {
-      STRAT.FLOOR_ENABLED = !STRAT.FLOOR_ENABLED;
-      logLine(`🎯 Plancher 4 trades/h : ${STRAT.FLOOR_ENABLED ? 'ACTIVÉ (comblements bridés 65-85$ x2)' : 'DÉSACTIVÉ'}`);
-      broadcast({ type: 'snapshot', data: snapshot() });
-    } else if (cmd.action === 'toggleRelax') {
-      STRAT.RELAX_RANGE_ENTRY = !STRAT.RELAX_RANGE_ENTRY;
-      logLine(`🔧 Assouplissement RANGE : ${STRAT.RELAX_RANGE_ENTRY ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
-      broadcast({ type: 'snapshot', data: snapshot() });
-    } else if (cmd.action === 'connect') {
-      // Les cles ne sont JAMAIS renvoyees au client (seul le prefixe apparait).
-      connectBinance(cmd.mode, cmd.key, cmd.secret);
-    } else if (cmd.action === 'reset') {
-      resetState(true);
-      logLine('🔄 Remise a zero de la session (stats/trades/capital) — positions Binance INTACTES, re-adoptees si presentes.');
-      broadcast({ type: 'snapshot', data: snapshot() });
-    }
-  });
-  ws.on('close', () => clients.delete(ws));
-});
-
-// ==================================================================
-// DASHBOARD
-// ==================================================================
-const DASHBOARD_HTML = `<!DOCTYPE html>
-<html lang="fr"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#00F5C8">
-<title>Itachi Multi — CryptoSignal AI</title>
-<style>
-  button,input{touch-action:manipulation} /* mobile : 2 taps rapprochés = 2 clics (pas de double-tap zoom) */
-  :root{--bg:#070b10;--card:#101820;--card2:#0e151d;--cyan:#00F5C8;--cyan-dim:rgba(0,245,200,.12);
-    --green:#22e58a;--red:#ff5470;--amber:#ffb547;--txt:#e7f0ef;--mut:#7c8b95;--line:#1a2530}
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:radial-gradient(1200px 600px at 50% -200px,rgba(0,245,200,.06),transparent),var(--bg);
-    color:var(--txt);font-family:'Segoe UI',system-ui,sans-serif;padding:14px;max-width:1200px;margin:0 auto}
-  .head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-  .logo{font-size:19px;font-weight:800}.logo .c{color:var(--cyan)}
-  .badge{padding:3px 9px;border-radius:6px;font-size:11px;font-weight:700;letter-spacing:.5px}
-  .badge.net{background:var(--cyan-dim);color:var(--cyan);border:1px solid rgba(0,245,200,.3)}
-  .badge.on{background:rgba(34,229,138,.15);color:var(--green)}
-  .badge.off{background:rgba(124,139,149,.15);color:var(--mut)}
-  .sub{color:var(--mut);font-size:12px;margin:4px 0 14px}
-  .controls{display:flex;gap:8px;margin:14px 0;flex-wrap:wrap}
-  button{border:0;border-radius:9px;padding:11px 20px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit}
-  .btn-go{background:var(--cyan);color:#04221d}.btn-stop{background:#1c2630;color:var(--txt)}
-  .btn-kill{background:rgba(255,84,112,.15);color:var(--red);border:1px solid rgba(255,84,112,.3)}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:14px}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:13px 15px}
-  .card .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
-  .card .v{font-size:20px;font-weight:800;margin-top:5px;font-variant-numeric:tabular-nums}
-  .green{color:var(--green)}.red{color:var(--red)}.cyan{color:var(--cyan)}.mut{color:var(--mut)}
-  .sec{font-size:13px;font-weight:700;margin:18px 0 8px;display:flex;align-items:center;gap:8px}
-  .sec .dot{width:6px;height:6px;border-radius:50%;background:var(--cyan)}
-  .table-wrap{border:1px solid var(--line);border-radius:12px;overflow-x:auto;background:var(--card2)}
-  table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:640px}
-  th,td{text-align:right;padding:8px 11px;border-bottom:1px solid var(--line);white-space:nowrap;font-variant-numeric:tabular-nums}
-  th:first-child,td:first-child{text-align:left}
-  th{color:var(--mut);font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;background:var(--card)}
-  .pill{padding:2px 8px;border-radius:5px;font-size:11px;font-weight:700}
-  .pill.long{background:rgba(34,229,138,.15);color:var(--green)}
-  .pill.short{background:rgba(255,84,112,.15);color:var(--red)}
-  .pill.flat{background:rgba(124,139,149,.15);color:var(--mut)}
-  .tag{padding:1px 6px;border-radius:5px;font-size:10px;font-weight:800;margin-left:4px}
-  .tag.exc{background:rgba(255,181,71,.18);color:var(--amber)}
-  .tag.exp{background:rgba(0,245,200,.16);color:var(--cyan)}
-  .log{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:12px;
-    font-family:Consolas,monospace;font-size:11px;max-height:200px;overflow:auto;color:#8aa0a0;line-height:1.7;margin-top:8px}
-  .qbadge{font-weight:800}
-</style></head>
-<body>
-  <div class="head">
-    <span class="logo">CryptoSignal<span class="c">AI</span> · Multi</span>
-    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.13d - Cadre R · 40 sym <span style="opacity:.6;font-weight:600">· WR ~49% · +0.6R/trade</span></span>
-    <span id="mode" class="badge net">TESTNET</span>
-    <span id="run" class="badge off">PAUSE</span>
-  </div>
-  <div class="sub" id="stratline">3.13d-Cadre R · risque/trade ≤1.2% · stop 1.5 ATR · partiel 50% +1R · trail 0.5R · paliers de mise · garde friction · verrou d'entrée · bonus Q70+ x9 · zéro rotation</div>
-
-  <div class="card" style="margin-bottom:12px">
-    <div class="k" style="color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.5px">Connexion Binance</div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px">
-      <button id="tabTest" class="btn-stop">TESTNET</button>
-      <button id="tabMain" class="btn-stop">MAINNET</button>
-      <input id="apiKey" type="text" placeholder="API Key" autocomplete="off" spellcheck="false" style="flex:1;min-width:170px;background:#0e151d;border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:9px 10px;font-size:12px"/>
-      <input id="apiSecret" type="password" placeholder="API Secret" autocomplete="off" style="flex:1;min-width:170px;background:#0e151d;border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:9px 10px;font-size:12px"/>
-      <button id="btnConnect" class="btn-go">🔐 Connecter</button>
-      <button id="btnReset" class="btn-kill">🔄 Reset</button>
-    </div>
-    <div id="connInfo" style="margin-top:7px;color:var(--mut);font-size:11px">—</div>
-  </div>
-
-  <div class="controls">
-    <button id="start" class="btn-go">▶ Démarrer</button>
-    <button id="stop" class="btn-stop">⏸ Pause</button>
-    <button id="closeAll" class="btn-kill">⏹ Tout fermer</button>
-    <button id="toggleRelax" class="btn-stop">🔧 Assoupli: —</button>
-    <button id="toggleFloor" class="btn-stop">🎯 Plancher 4/h: —</button>
-    <button id="toggleBonus" class="btn-stop">🎰 Bonus: —</button>
-  </div>
-
-  <div class="grid">
-    <div class="card"><div class="k">Capital</div><div class="v" id="cap">—</div></div>
-    <div class="card"><div class="k">P&L Net</div><div class="v" id="net">—</div></div>
-    <div class="card"><div class="k">Win Rate</div><div class="v" id="wr">—</div></div>
-    <div class="card"><div class="k">Trades</div><div class="v" id="ntr">0</div></div>
-    <div class="card"><div class="k">Gagnants (net)</div><div class="v green" id="wins">0</div></div>
-    <div class="card"><div class="k">Perdants (net)</div><div class="v red" id="losses">0</div></div>
-    <div class="card"><div class="k">Positions</div><div class="v" id="pos">0/0</div></div>
-    <div class="card"><div class="k">Mises 9% actives</div><div class="v cyan" id="exc">0/0</div></div>
-    <div class="card"><div class="k">Exposition</div><div class="v" id="exp">—</div></div>
-    <div class="card"><div class="k">Drawdown</div><div class="v" id="dd">0%</div></div>
-    <div class="card"><div class="k">Frais</div><div class="v mut" id="fees">—</div></div>
-  </div>
-
-  <div class="sec"><span class="dot"></span>Positions ouvertes</div>
-  <div class="table-wrap"><table>
-    <thead><tr><th>Symbole</th><th>Sens</th><th>Lev·Q</th><th>Entrée</th><th>Actuel</th><th>Investi</th><th>SL</th><th>TP</th><th>⏱ Durée</th><th>P&L live</th><th>Action</th></tr></thead>
-    <tbody id="positions"><tr><td colspan="11" class="mut" style="text-align:center;padding:14px">Aucune position</td></tr></tbody>
-  </table></div>
-
-  <div class="sec"><span class="dot"></span>Surveillance des symboles</div>
-  <div class="table-wrap"><table>
-    <thead><tr><th>Symbole</th><th>Prix</th><th>Courbe</th><th>Biais</th><th>Q</th><th>RSI</th><th>Funding</th><th>Régime</th><th>Statut</th></tr></thead>
-    <tbody id="symbols"></tbody>
-  </table></div>
-
-  <div class="sec"><span class="dot"></span>Historique des trades</div>
-  <div class="table-wrap"><table>
-    <thead><tr><th>Symbole</th><th>Sens</th><th>Lev</th><th>Entrée</th><th>Sortie</th><th>Investi</th><th>P&L%</th><th>Brut</th><th>Frais Binance</th><th>Net retirable</th><th>⏱ Durée</th><th>Raison</th></tr></thead>
-    <tbody id="trades"></tbody>
-  </table></div>
-
-  <div class="sec"><span class="dot"></span>Journal</div>
-  <div class="log" id="log"></div>
-
-<script>
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  let ws = null;
-  let wsReady = false;
-  // Confirmation de fermeture en 2 taps : sym -> échéance (ms). Remplace confirm()
-  // natif, que Chrome peut bloquer définitivement ("ne plus afficher de dialogues")
-  // après des fermetures manuelles répétées -> bouton Fermer qui ne répond plus.
-  var pendingClose = {};
-  function wsSend(obj){
-    // Envoi sûr : si la connexion n'est pas prête, on ne perd pas le clic silencieusement.
-    if(ws && ws.readyState === WebSocket.OPEN){ ws.send(JSON.stringify(obj)); }
-    else { console.warn('WS pas prêt, action ignorée:', obj); }
-  }
-  function connect(){
-    ws = new WebSocket(proto + '://' + location.host);
-    ws.onopen = ()=>{ wsReady=true; console.log('WS connecté'); };
-    ws.onmessage = onWsMessage;
-    ws.onclose = ()=>{
-      wsReady=false;
-      $('run').textContent='RECONNEXION…'; $('run').className='badge off';
-      setTimeout(connect, 1500); // reconnexion automatique (Railway peut couper les WS inactifs)
-    };
-    ws.onerror = ()=>{ try{ ws.close(); }catch(e){} };
-  }
-  const $ = id => document.getElementById(id);
-  const num = (n,d=2) => Number(n).toLocaleString('fr-FR',{minimumFractionDigits:d,maximumFractionDigits:d});
-  const sign = n => n>=0?'+':'';
-  const cls = n => n>=0?'green':'red';
-  function px(v){ const n=Number(v); return n>=100?num(n,2):n>=1?num(n,3):num(n,5); }
-  function dur(ms){ if(ms==null)return '—'; let s=Math.floor(ms/1000); const h=Math.floor(s/3600); s%=3600; const m=Math.floor(s/60); const r=s%60; return (h>0?h+'h':'')+(m<10&&h>0?'0':'')+m+':'+(r<10?'0':'')+r; }
-
-  function renderStats(s){
-    $('mode').textContent=(s.mode||'testnet').toUpperCase();
-    $('run').textContent=s.killed?'KILL -45%':(s.running?'EN MARCHE':'PAUSE');
-    $('run').className='badge '+(s.running?'on':'off');
-    if($('toggleRelax'))$('toggleRelax').textContent='🔧 Assoupli: '+(s.strat&&s.strat.relaxOn?'ON':'OFF');
-    if($('toggleFloor'))$('toggleFloor').textContent='🎯 Plancher 4/h: '+(s.strat&&s.strat.floorOn?'ON':'OFF');
-    if($('toggleBonus')){var bs=s.bonusStats||{count:0,wins:0,losses:0,net:0};$('toggleBonus').textContent='🎰 Bonus: '+(s.strat&&s.strat.bonusOn?'ON':'OFF')+(bs.count?' ('+bs.wins+'W/'+bs.losses+'L '+(bs.net>=0?'+':'')+bs.net.toFixed(0)+'$)':'');}
-    $('stratline').textContent='3.13d-Cadre R · risque/trade ≤1.2% cap · stop 1.5×ATR(14) · partiel 50% à +1R puis break-even · trail 0.5R · paliers de mise par capital + modulation ATR · garde friction 6× · bonus loterie Q70+ 25-50$ x9 SL-5% · zéro rotation · multi-régime · x2-5';
-      if($('connInfo')) $('connInfo').textContent = s.connected ? ('🔐 Connecté '+(s.mode||'').toUpperCase()+' — clé '+(s.keyPrefix||'')+'…') : '⚠️ Non connecté — lecture seule (choisis un mode, colle tes clés, 🔐 Connecter)';
-    if(s.connected && $('btnConnect') && $('btnConnect').textContent.indexOf('⏳')===0){ $('apiKey').value=''; $('apiSecret').value=''; $('btnConnect').textContent='🔐 Connecter'; selMode=null; }
-    paintTabs(s.mode);
-  $('cap').textContent='$'+num(s.capital);
-    $('net').textContent=sign(s.stats.net)+'$'+num(s.stats.net); $('net').className='v '+cls(s.stats.net);
-    $('wr').textContent=s.winRate!=null?Math.round(s.winRate)+'%':'—';
-    $('wr').className='v '+(s.winRate>=50?'green':s.winRate!=null?'red':'mut');
-    $('ntr').textContent=s.stats.wins+s.stats.losses;
-    $('wins').textContent=s.stats.wins;
-    $('losses').textContent=s.stats.losses;
-    $('pos').textContent=s.openPositions+'/'+s.maxPositions;
-    if($('exc')) $('exc').textContent=(s.excOpen!=null?s.excOpen:0)+'/'+(s.excMax!=null?s.excMax:2);
-    $('exp').textContent='$'+num(s.exposure)+' / '+num(s.maxExposure);
-    $('dd').textContent=(s.maxDrawdown||0).toFixed(1)+'%';
-    $('fees').textContent='$'+num(s.stats.fees);
-  }
-
-  function renderPositions(list){
-    const tb=$('positions');
-    // FIX clavier mobile : si l'utilisateur est en train de taper un % (champ focus),
-    // on ne reconstruit PAS le tableau (sinon l'input est détruit -> le clavier se ferme).
-    const ae=document.activeElement;
-    if(ae&&ae.id&&ae.id.indexOf('pct_')===0)return;
-    // Préserver les % déjà saisis entre deux rafraîchissements (sinon retour à 100 avant le clic Fermer)
-    const saved={};
-    tb.querySelectorAll('input[id^="pct_"]').forEach(el=>{saved[el.id]=el.value;});
-    if(!list||!list.length){tb.innerHTML='<tr><td colspan="11" class="mut" style="text-align:center;padding:14px">Aucune position</td></tr>';return;}
-    tb.innerHTML=list.map(p=>{
-      const sc=p.side==='BUY'?'long':'short',st=p.side==='BUY'?'LONG':'SHORT';
-      return '<tr><td>'+p.symbol+'</td><td><span class="pill '+sc+'">'+st+'</span></td>'+
-        '<td>'+p.lev+'x·Q'+p.quality+'</td><td>'+px(p.entry)+'</td><td>'+px(p.current)+'</td>'+
-        '<td>$'+num(p.investi)+'</td><td class="red">'+px(p.sl)+'</td><td class="green">'+px(p.tp)+'</td>'+
-        '<td class="'+((p.timeStopMs&&p.ageMs>p.timeStopMs*0.8)?'red':'mut')+'">'+dur(p.ageMs)+(p.adopted?' <span style="color:var(--amber);font-size:9px">adopté</span>':'')+'</td>'+
-        '<td class="'+cls(p.netLive)+'">'+sign(p.netLive)+'$'+num(p.netLive)+' ('+sign(p.pnlPct)+p.pnlPct.toFixed(2)+'%)</td>'+
-        '<td style="white-space:nowrap"><input id="pct_'+p.symbol+'" type="number" min="1" max="100" value="'+(saved['pct_'+p.symbol]||'100')+'" style="width:42px;background:#0e151d;border:1px solid var(--line);color:var(--txt);border-radius:5px;padding:3px;font-size:11px"/>%'+
-        ' <button data-sym="'+p.symbol+'" class="closeBtn" style="background:'+((pendingClose[p.symbol]&&Date.now()<pendingClose[p.symbol])?'rgba(255,84,112,.5)':'rgba(255,84,112,.15)')+';color:var(--red);border:1px solid rgba(255,84,112,.3);border-radius:6px;padding:4px 8px;font-size:11px;font-weight:700;cursor:pointer">'+((pendingClose[p.symbol]&&Date.now()<pendingClose[p.symbol])?'Confirmer ?':'Fermer')+'</button></td></tr>';
-    }).join('');
-  }
-
-  function sparkline(data){
-    if(!data || data.length < 2) return '<span class="mut">—</span>';
-    const w=72, h=22, n=data.length;
-    const min=Math.min(...data), max=Math.max(...data);
-    const range=(max-min)||1;
-    const pts=data.map((v,i)=>{
-      const x=(i/(n-1))*w;
-      const y=h-((v-min)/range)*h;
-      return x.toFixed(1)+','+y.toFixed(1);
-    }).join(' ');
-    const up=data[data.length-1]>=data[0];
-    const col=up?'#22e58a':'#ff5470';
-    return '<svg width="'+w+'" height="'+h+'" viewBox="0 0 '+w+' '+h+'" style="vertical-align:middle">'+
-      '<polyline points="'+pts+'" fill="none" stroke="'+col+'" stroke-width="1.5"/></svg>';
-  }
-
-  function renderSymbols(list){
-    const tb=$('symbols');
-    tb.innerHTML=(list||[]).map(s=>{
-      const b=s.bias||'NEUTRE';
-      const bc=b==='LONG'?'long':b==='SHORT'?'short':'flat';
-      const q=s.quality!=null?s.quality:'—';
-      const qcol=s.quality>=49?'cyan':'mut';
-      const fnd=s.funding!=null?(s.funding>=0?'+':'')+(s.funding*100).toFixed(3)+'%':'—';
-      const fndCol=s.funding!=null&&Math.abs(s.funding)>=0.0005?(s.funding>0?'red':'green'):'mut';
-      const regTxt=s.regime==='UP'?'<span style="color:var(--green)">▲ UP</span>':s.regime==='DOWN'?'<span style="color:var(--red)">▼ DOWN</span>':s.regime==='RANGE'?'<span style="color:var(--cyan)">↔ RANGE</span>':'—';
-      return '<tr><td>'+s.symbol+'</td><td>'+(s.price?px(s.price):'—')+'</td>'+
-        '<td>'+sparkline(s.spark)+'</td>'+
-        '<td><span class="pill '+bc+'">'+b+'</span></td>'+
-        '<td class="qbadge '+qcol+'">'+q+'</td>'+
-        '<td>'+(s.rsi!=null?s.rsi.toFixed(0):'—')+'</td>'+
-        '<td class="'+fndCol+'">'+fnd+'</td>'+
-        '<td>'+regTxt+'</td>'+
-        '<td>'+(s.hasPosition?'<span class="pill long">EN POSITION</span>':(s.disabled?'<span class="pill short">EXCLU</span>':(s.illiquid?'<span class="pill short" style="opacity:.7">ILLIQUIDE</span>':'<span class="mut">-</span>')))+'</td></tr>';
-    }).join('');
-  }
-
-  function renderTrades(list){
-    const tb=$('trades');
-    if(!list||!list.length){tb.innerHTML='<tr><td colspan="12" class="mut" style="text-align:center;padding:14px">Aucun trade</td></tr>';return;}
-    tb.innerHTML=list.map(t=>{
-      const net=Number(t.net),gross=Number(t.gross!=null?t.gross:net),sc=t.side==='BUY'?'long':'short',st=t.side==='BUY'?'LONG':'SHORT';
-      return '<tr><td>'+t.symbol+'</td><td><span class="pill '+sc+'">'+st+'</span></td><td>'+t.lev+'x</td>'+
-        '<td>'+px(t.entry)+'</td><td>'+px(t.exit)+'</td><td>$'+num(t.investi)+'</td>'+
-        '<td class="'+cls(Number(t.pnlPct))+'">'+sign(Number(t.pnlPct))+t.pnlPct+'%</td>'+
-        '<td class="'+cls(gross)+'">'+sign(gross)+'$'+num(gross)+'</td>'+
-        '<td class="mut">-$'+num(t.fees)+'</td>'+
-        '<td class="'+cls(net)+'" style="font-weight:700">'+sign(net)+'$'+num(net)+'</td>'+
-        '<td class="mut">'+dur(t.durationMs)+'</td>'+
-        '<td class="mut">'+t.reason+'</td></tr>';
-    }).join('');
-  }
-
-  let snap=null;
-  function onWsMessage(e){
-    const m=JSON.parse(e.data);
-    if(m.type==='snapshot'){snap=m.data;renderStats(snap);renderPositions(snap.positions);renderSymbols(snap.symbols);renderTrades(snap.trades);$('log').innerHTML=(snap.log||[]).join('<br>');}
-    else if(snap){
-      if(m.type==='status'){snap.running=m.running;renderStats(snap);}
-      if(m.type==='symbols'){snap.symbols=m.symbols;renderSymbols(m.symbols);}
-      if(m.type==='positions'){snap.positions=m.positions;renderPositions(m.positions);}
-      if(m.type==='trade'){snap.stats=m.stats;snap.capital=m.capital;snap.positions=m.positions;renderStats(snap);renderPositions(m.positions);}
-      if(m.type==='log'){snap.log.unshift(m.line);if(snap.log.length>50)snap.log.pop();$('log').innerHTML=snap.log.join('<br>');}
-      if(m.type==='logs'){for(let i=m.lines.length-1;i>=0;i--)snap.log.unshift(m.lines[i]);while(snap.log.length>50)snap.log.pop();$('log').innerHTML=snap.log.join('<br>');}
-    }
-  }
-  document.addEventListener('click', function(ev){
-    const btn = ev.target.closest && ev.target.closest('.closeBtn');
-    if(!btn) return;
-    const sym = btn.getAttribute('data-sym');
-    const now = Date.now();
-    if(!pendingClose[sym] || now > pendingClose[sym]){
-      // 1er tap : ARMER pendant 4s (aucun dialogue natif -> fiable sur mobile)
-      pendingClose[sym] = now + 8000; // 8s pour confirmer
-      btn.textContent = 'Confirmer ?';
-      btn.style.background = 'rgba(255,84,112,.5)';
-      setTimeout(function(){
-        if(Date.now() > (pendingClose[sym]||0)){
-          delete pendingClose[sym];
-          const b = document.querySelector('.closeBtn[data-sym="'+sym+'"]');
-          if(b){ b.textContent='Fermer'; b.style.background='rgba(255,84,112,.15)'; }
-        }
-      }, 8200);
-      return;
-    }
-    // 2e tap dans les 4s : ENVOI réel
-    delete pendingClose[sym];
-    const inp = document.getElementById('pct_'+sym);
-    const pct = inp ? Math.max(1, Math.min(100, Number(inp.value)||100)) : 100;
-    wsSend({action:'closeManual', symbol:sym, pct:pct});
-    btn.textContent = '⏳ envoi…';
-  });
-  $('toggleRelax').onclick=()=>wsSend({action:'toggleRelax'});
-  $('toggleFloor').onclick=()=>wsSend({action:'toggleFloor'});
-  if($('toggleBonus'))$('toggleBonus').onclick=()=>wsSend({action:'toggleBonus'});
-  $('start').onclick=()=>wsSend({action:'start'});
-  $('stop').onclick=()=>wsSend({action:'stop'});
-  $('closeAll').onclick=()=>wsSend({action:'closeAll'});
-  var selMode = null; // onglet choisi par l'utilisateur (sinon suit le mode serveur)
-  function paintTabs(serverMode){
-    var m = selMode || serverMode || 'testnet';
-    var t=$('tabTest'), M=$('tabMain');
-    if(!t||!M) return;
-    t.style.background = m==='testnet' ? 'var(--cyan)' : '#1c2630';
-    t.style.color = m==='testnet' ? '#04221d' : 'var(--txt)';
-    t.style.fontWeight='800';
-    M.style.background = m==='mainnet' ? 'var(--red)' : '#1c2630';
-    M.style.color = m==='mainnet' ? '#fff' : 'var(--txt)';
-    M.style.fontWeight='800';
-  }
-  $('tabTest').onclick=function(){ selMode='testnet'; paintTabs(); };
-  $('tabMain').onclick=function(){ selMode='mainnet'; paintTabs(); };
-  $('btnConnect').onclick=function(){
-    var m = selMode || (snap && snap.mode) || 'testnet';
-    var k = $('apiKey').value.trim(), s = $('apiSecret').value.trim();
-    if(!k || !s){ $('connInfo').textContent='⚠️ Colle la clé ET le secret avant de connecter.'; return; }
-    if(m==='mainnet' && !confirm('MAINNET = ARGENT RÉEL sur ton compte Binance. Confirmer la connexion ?')) return;
-    wsSend({action:'connect', mode:m, key:k, secret:s});
-    $('btnConnect').textContent='⏳ connexion…';
-  };
-  $('btnReset').onclick=function(){
-    if(confirm('Remettre stats, trades et capital à ZÉRO ? (les positions Binance restent intactes)')) wsSend({action:'reset'});
-  };
-  paintTabs('testnet');
-  connect(); // établit la connexion + reconnexion auto
-</script>
-</body></html>`;
-
-// ==================================================================
-// DÉMARRAGE
-// ==================================================================
-async function start() {
-  logLine(`\u{1F680} Itachi — SERVEUR 3.13d-Cadre R (plafond de risque : mise x levier x 1R <= 1.2% du capital, le levier s'ajuste — decret Calvin 01/08) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
-  logLine(`\u{1F4C8} 3.13d-Cadre R — stop 1.5xATR / partiel 1R -> BE / trail 0.5R — paliers + modulation ATR — RISQUE/TRADE <= 1.2% capital (levier auto-reduit) — garde friction 6x — bonus x9 intouche — zero rotation`);
-  if (!API_KEY || !API_SECRET) logLine('\u26A0\uFE0F Aucune cle — choisis TESTNET/MAINNET dans le dashboard, colle tes cles et clique 🔐 Connecter.');
-  else logLine(`🔐 Cles trouvees en variables d'environnement — mode ${MODE.toUpperCase()} pre-connecte (reconnexion auto post-redeploiement).`);
-
-  // 0) LE SERVEUR HTTP DÉMARRE EN PREMIER : le dashboard s'affiche tout de suite,
-  //    avant tout appel réseau. Il se remplit de données ensuite (arrière-plan).
-  server.listen(PORT, '0.0.0.0', () => {
-    const source = process.env.PORT ? 'Railway' : "fallback 8080 - Railway n'injecte pas PORT";
-    logLine(`\u{1F310} Dashboard sur le port ${PORT} [${source}] — pret.`);
-  });
-
-  // Initialisation NON BLOQUANTE en arrière-plan.
-  (async () => {
-    try {
-      await loadSymbolInfo();
-      const uni = await scanUniverse();
-      await applyUniverse(uni);
-      await refreshAllKlines();
-      connectPriceStreams();
-      logLine('\u2705 Initialisation complete — bot pret a demarrer.');
-    } catch (e) {
-      logLine(`\u26A0\uFE0F Init arriere-plan: ${e.message} — dashboard actif, reessai auto.`);
-    }
-    syncTimeAndWarm(); // premier alignement d'horloge immédiat
-    setInterval(syncTimeAndWarm, 3000); // puis toutes les 3s (poids API : 1 -> négligeable)
-    setInterval(refreshAllKlines, STRAT.SIGNAL_REFRESH_MS);
-    setInterval(refreshUniverse, STRAT.UNIVERSE_REFRESH_MS);
-    setInterval(reconcile, 9000);
-    setInterval(() => {
-      if (clients.size === 0) return; // dashboard ferme -> ne pas meme construire l'overview
-      // N'envoie l'overview que si son contenu a changé (évite de répéter le même
-      // gros paquet toutes les 5s pour rien). Empreinte légère sur les champs utiles.
-      const ov = symbolsOverview();
-      const sig = ov.map((s) => `${s.symbol}${s.price}${s.bias}${s.quality}${s.regime}`).join('|');
-      if (sig !== state._lastOvSig) { state._lastOvSig = sig; broadcast({ type: 'symbols', symbols: ov }); }
-    }, 5000);
-  })();
-}
-
-start();
+          symbol, side: closeSide, type: orderT
