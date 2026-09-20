@@ -1,5 +1,90 @@
 /* ============================================================
- *  SERVEUR 3.23 - FUSION  (risque par trade 1.8%)
+ *  SERVEUR 3.26 - SWING 25 CRYPTOS  (levier gradue par note)
+ *  ------------------------------------------------------------
+ *  DECRETS CALVIN 20/09 : note minimum 60 · loterie Q >= 75 ·
+ *  levier x2 (Q60-69) / x3 (Q70-78) / x5 (Q79-85) / x7 (Q86-100).
+ *
+ *  CONSEQUENCE ARITHMETIQUE, A LIRE AVANT DE LANCER :
+ *  mise 100$ (minimum impose) x levier x stop 12% = la perte par trade
+ *  n est plus 12$ mais suit le levier :
+ *     Q60-69  x2 -> position  200$ -> perte pleine  24$
+ *     Q70-78  x3 -> position  300$ -> perte pleine  36$
+ *     Q79-85  x5 -> position  500$ -> perte pleine  60$
+ *     Q86-100 x7 -> position  700$ -> perte pleine  84$
+ *  Mise 100$ + stop 12% + perte 12$ ne peuvent pas coexister avec un levier :
+ *  a x1 la perte vaut 12$, a x7 elle vaut 84$. Le decret du levier est donc
+ *  applique, et le plafond de risque par trade a du etre releve a 11% du
+ *  capital (RISK_CAP_PCT) sans quoi le code aurait rabattu chaque trade a x1.
+ *  Kill switch inchange a -25% : ~2 pertes a x7 (168$) suffisent a l atteindre
+ *  sur 769$ de capital.
+ *
+ *  BACKTEST DU LEVIER GRADUE (25 cryptos, juin-aout 2026, note 60, stop 12%,
+ *  trailing arme a +12% puis rend 3%) :
+ *     mise 100$ a x1 : juin-juil -45$ · aout +50$  -> +5$ sur 3 mois
+ *     levier x2-x7   : juin-juil -411$ · aout +290$ -> -121$ sur 3 mois
+ *  Le levier gradue AMPLIFIE dans les deux sens : sur cet echantillon les
+ *  notes elevees n ont pas mieux performe, donc il degrade le resultat et
+ *  multiplie par 7 la pire perte (-84$ au lieu de -12$).
+ *  Revenir a une perte fixe de 12$ : remettre LEV_BY_Q a { lev: 1 } partout.
+ *
+ *  HISTORIQUE 3.25 - SWING 25 CRYPTOS  (decrets Calvin 20/09)
+ *  ------------------------------------------------------------
+ *  DECRETS : note minimum d entree 75 · loterie Q >= 88 · stop 12% ·
+ *  TP 12% mais on laisse courir · univers 25 cryptos.
+ *
+ *  TRADUCTION EN CODE :
+ *  - Q_MIN_ENTRY = Q_MIN_ENTRY_RANGE = 75 (etait 45 / 55).
+ *  - BONUS_MIN_Q = 88 (etait 70) ; mise et levier montent de Q88 a Q90.
+ *  - SL_FIXED_PCT = 0.12. Avec RISK_USD 12$ : notionnel = 12/0.12 = 100$,
+ *    donc mise 100$ a x1 (mise minimum respectee, perte pleine 12$).
+ *  - "TP 12% mais laisse courir" : le trailing s ARME a +12% (= +1R = +12$)
+ *    puis rend au maximum 3% (0.25R) depuis le pic. Rien n est ferme a 12% :
+ *    le TP natif Binance reste loin (35%) comme simple securite.
+ *  - CORE 10 majors + 15 dynamiques = 25 cryptos.
+ *
+ *  BACKTEST DE CES REGLAGES (klines 1h, 25 cryptos, juin-aout 2026, aout en
+ *  aveugle, frais 0.05%/cote, perte fixee a 12$) — resultats bruts :
+ *    6 positions, trailing arme +12%, rend 3% : 12 trades juin-juil (-52$)
+ *      puis 20 trades aout (+43$) -> -9$ sur 3 mois.
+ *    Avec 16 positions, meme reglage : 79 trades, -86$ puis +104$ -> +18$.
+ *    Variante trailing arme a +6% : WR 71% / 62% mais total ~0$.
+ *  Autrement dit : ces reglages ne sont PAS gagnants sur les 3 mois testes,
+ *  ils sont au mieux a l equilibre. Deux raisons mesurees :
+ *    1) note 75 + stop 12% = tres peu de trades (~6/mois sur 6 positions) et
+ *       des positions qui bloquent un slot pendant des semaines ;
+ *    2) le gain moyen (11-15$) ne depasse pas la perte pleine (12$).
+ *  Reference 3.24 (stop 3%, note 45/55, 10 majors) : +202$ sur les 3 mois.
+ *  Tout est reglable en une ligne : SL_FIXED_PCT, Q_MIN_ENTRY, TRAIL_ARM_R.
+ *
+ *  HISTORIQUE 3.24 - SWING 10 MAJORS  (cahier des charges Calvin 20/09)
+ *  ------------------------------------------------------------
+ *  DEMANDE : 10 cryptos sures · trades longs sans limite de duree ·
+ *  perte 10-15$ par trade · gain vise 25-250$ · mise minimum 100$.
+ *
+ *  REGLAGE RETENU (backtest klines 1h Binance, 10 majors, juin-aout 2026,
+ *  frais 0.05%/cote, aout en aveugle) :
+ *    univers 10 majors · stop FIXE 3% · trailing arme a +2R puis 0.5R sous le pic
+ *    note min 45 (55 en range) · plafond volatilite 3%/h · 6 positions · zero partiel
+ *    141 trades · WR 36.2% · gain moyen +25.5$ · perte moyenne -12.2$
+ *    esperance +1.43$/trade · total +202$ sur 3 mois · meilleur trade +52$
+ *
+ *  CE QUE LE BACKTEST DIT AUSSI, SANS FILTRE :
+ *  - un gain MOYEN de 25$ impose d attendre +2R : le WR tombe a ~36%. Les deux
+ *    ne sont pas compatibles (la regle WR>=55% du 19/09 ne tient plus ici).
+ *  - 250$ sur un trade n est JAMAIS arrive en 3 mois avec un stop a 12$ :
+ *    le meilleur a fait +52$ (~4R). 250$ = +20R, il faut une tendance de
+ *    plusieurs semaines, ou un risque par trade bien plus gros.
+ *  - les mois sont irreguliers : juin -150$, juillet -11$, aout +398$ (5 pos).
+ *
+ *  MISE = RISQUE EN DOLLARS (plus en % d un capital fige) :
+ *    notionnel = RISK_USD / SL_FIXED_PCT = 12$ / 3% = 400$
+ *    levier plafonne pour garantir la mise minimum : 400$ / 100$ = x4 max
+ *    -> mise 100$ x4, perte pleine 12$, +2R = +24$, +4R = +48$.
+ *  INTERRUPTEUR : TRAIL_ARM_R 2.0 = profil "gros gains" (ci-dessus).
+ *    Le mettre a 1.0 donne le profil regulier : WR ~54%, gain moyen 12$,
+ *    esperance +0.98$/trade, 211 trades. Une seule ligne a changer.
+ *
+ *  HISTORIQUE 3.23 - FUSION  (risque par trade 1.8%)
  *  ------------------------------------------------------------
  *  DECRET CALVIN 19/09 : plafond de risque par trade 1.2% -> 1.8%.
  *  Strategie INCHANGEE (stop 5%, trailing Champion, zero partiel, note min,
@@ -944,7 +1029,7 @@ const STRAT = {
     [12000, 445, 800], [35000, 1650, 3250], [Infinity, 1650, 5000],
   ],
   ATR_MOD_LO: 0.006, ATR_MOD_HI: 0.029, // bornes de modulation ATR dans la fourchette du palier
-  RISK_CAP_PCT: 0.018,  // 3.23 (decret Calvin 19/09) : 1.2% -> 1.8% du capital par trade. Mettre 0.015 pour le compromis, 0.012 pour le reglage backteste d origine. Plafond = mise x levier x 1R.
+  RISK_CAP_PCT: 0.11,   // 3.26 : releve de 1.8% a 11% du capital, SINON le code rabattrait chaque trade a x1 et le levier gradue ne s appliquerait jamais (84$ de perte a x7 = 10.9% de 769$). Remettre 0.018 pour retrouver le garde-fou.
   // --- 3.13e MODE VOLATIL (decret 08/08, backtest bimodal valide) ---
   GHOST_CONFIRM_N: 2,      // 3.14c : nb d'absences CONSECUTIVES de positionRisk avant de declarer une fermeture native
   GHOST_MIN_AGE_MS: 20000, // 3.14c : une position de moins de 20s n'est jamais declaree fermee nativement
@@ -985,13 +1070,13 @@ const STRAT = {
   TAKER_MAX_DRIFT: 0.003, // 0.3% d'écart max pour tolérer un fallback taker
 
   // --- Levier x2 -> x5 indexe sur la qualite ---
-  LEV_BY_Q: [                  // 3.19 (decret 15/09) : +1 cran (etait 5/4/3/2)
-    { q: 75, lev: 6 },
-    { q: 60, lev: 5 },
-    { q: 45, lev: 4 },
-    { q: 0,  lev: 3 },
+  LEV_BY_Q: [                  // 3.26 (decret Calvin 20/09) : levier gradue par note
+    { q: 86, lev: 7 },         //   Q86-100 -> x7 (position 700$, perte pleine 84$)
+    { q: 79, lev: 5 },         //   Q79-85  -> x5 (position 500$, perte pleine 60$)
+    { q: 70, lev: 3 },         //   Q70-78  -> x3 (position 300$, perte pleine 36$)
+    { q: 0,  lev: 2 },         //   Q60-69  -> x2 (position 200$, perte pleine 24$)
   ],
-  LEV_MAX: 6,
+  LEV_MAX: 7,
 
   Q_FOR_MAX_STAKE: 80,  // Q>=80 -> mise max 280$ ; interpolation lineaire depuis 80$
 
@@ -1000,18 +1085,18 @@ const STRAT = {
   PREMIUM_RESERVE_SLOTS: 2,      // 3.17 : nombre de pleines mises gardees INTOUCHABLES pour les signaux premium. 0 = comportement 3.16 restaure.
   // --- 3.22 FUSION (backtest juin-aout 2026) ---
   SL_MODE: 'fixe',               // 'fixe' = stop 5% (Champion, backteste) | 'atr' = cadre R 3.21
-  SL_FIXED_PCT: 0.05,            // stop = 5% du prix, identique partout
-  TRAIL_ARM_PX: 0.012,           // trailing arme a +1.2% de prix...
-  TRAIL_PX: 0.015,               // ...puis ferme 1.5% sous le pic
+  SL_FIXED_PCT: 0.12,            // 3.25 (decret 20/09) : stop 12% du prix. Notionnel = RISK_USD/0.12 = 100$ -> mise 100$ a x1, perte pleine 12$.
+  TRAIL_MODE: 'R',               // 3.24 : 'R' = trailing en multiples de risque (swing) | 'px' = trailing Champion 3.22
+  TRAIL_ARM_R: 1.0,              // 3.25 (decret 20/09) : TP a 12% = +1R : le trailing s ARME la, mais rien n est ferme — on laisse courir.
+  TRAIL_GIVEBACK_R: 0.25,        // 3.25 : apres armement, on rend au maximum 0.25R (3% de prix) depuis le pic (meilleure variante testee).
+  RISK_USD: 12,                  // 3.24 (decret Calvin 20/09) : perte pleine visee en DOLLARS (fourchette demandee 10-15$)
+  MIN_STAKE_USD: 100,            // 3.24 : mise minimum imposee -> plafonne le levier a notionnel/100
+  TRAIL_ARM_PX: 0.012,           // (3.22, utilise seulement si TRAIL_MODE='px')
+  TRAIL_PX: 0.015,               // (3.22)
   PARTIAL_ENABLED: false,        // aucun partiel : on laisse courir (ablation : le partiel coute)
   VOLCAP_ATR_PCT: 0.03,          // symbole refuse si ATR(14) 1h > 3%/h
-  Q_MIN_ENTRY: 45,               // note minimum d'entree (tendance)
-  Q_MIN_ENTRY_RANGE: 55,         // note minimum d'entree en RANGE
-  RISK_MULT_BY_Q: [              // module le risque (donc la mise) selon Q, plafond RISK_CAP_PCT intact
-    { q: 80, mult: 1.00 },
-    { q: 60, mult: 0.80 },
-    { q: 0,  mult: 0.55 },
-  ],
+  Q_MIN_ENTRY: 60,               // 3.26 (decret 20/09) : note minimum d entree 60 (etait 75)
+  Q_MIN_ENTRY_RANGE: 60,         // 3.26 (decret 20/09) : 60 aussi en RANGE
   // --- 3.18 MISE INDEXEE SUR Q (decret Calvin 15/09) — actif si SL_MODE='atr' ---
   Q_BOOST: 80,                   // Q >= 80 -> mise boostee
   BOOST_REF_STAKE: 200,          // mise boostee au palier 1 (200$)...
@@ -1031,7 +1116,7 @@ const STRAT = {
     { at: '2026-12-09T19:00:00Z', label: 'FOMC + SEP/dot plot' },
   ],
   RESIDUAL_STAKES: [30, 20, 10], // 3.16 (decret 03/09) : quand la marge ne couvre plus la pleine mise de palier, on descend a la plus grosse de ces valeurs qui passe. Ordre decroissant OBLIGATOIRE.
-  MAX_POSITIONS_CAP: 8,  // 3.22 (backtest) : 10 -> 8 // decret Calvin 03/09/2026 : 8 -> 10 positions constantes (mise plafonnee par SLOT_BUDGET_PCT). Ancien : decret 30/08/2026 6 -> 8 positions (la garde marge reste l'arbitre reel ; a 950$ la 7e/8e seront souvent refusees faute de marge, c'est voulu)
+  MAX_POSITIONS_CAP: 6,  // 3.24 (backtest) : 6 positions x 100$ = 600$ de marge max
   MAX_EXPOSURE_PCT: 6.0, // exposition relevee a 600% (garde-fou)
 
   // --- ROTATION DE CAPITAL : fermer un mini-perdant essouffle pour un slot EXCELLENT ---
@@ -1046,8 +1131,9 @@ const STRAT = {
   COOLDOWN_AFTER_STOP_MS: 3600000, // cooldown 1h sur un symbole apres un stop
 
   // --- Univers dynamique : cryptos les plus volatiles ET liquides de Binance ---
-  CORE_SYMBOLS: ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'DOGEUSDT'], // noyau TOUJOURS présent
-  DYNAMIC_SIZE: 85,         // 3.18 (decret Calvin 15/09) : 85 volatils + 5 du noyau = 90 cryptos. 180 flux WS (limite Binance 200). Filtres liquidite (100M$) et spread inchanges.
+  CORE_SYMBOLS: ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
+                 'DOGEUSDT', 'ADAUSDT', 'LINKUSDT', 'AVAXUSDT', 'LTCUSDT'], // 3.24 : les 10 majors backtestes, univers FIGE
+  DYNAMIC_SIZE: 15,         // 3.25 (decret 20/09) : 10 majors du noyau + 15 dynamiques = 25 cryptos.
   UNIVERSE_REFRESH_MS: 3600000, // re-scan de l'univers toutes les heures
   UNIVERSE_MIN_VOL_USDT: 100000000, // 100M$ : élargi 150->100M (plus de candidats = plus d'opportunités) ;
                                     // la protection fine est désormais le SPREAD du carnet réel, mesure
@@ -1103,7 +1189,7 @@ const STRAT = {
   //     pour marches AGITES uniquement, COMPTEUR SEPARE, bouton dashboard, OFF possible.
   BONUS_ENABLED: true,
   BONUS_INTERVAL_MS: 3600000,   // 1 bonus par heure maximum
-  BONUS_MIN_Q: 70, // 3.20 (decret 15/09) : retour a 70 (3.19 : 50). Historique :              // decret Calvin 28/07 : bonus reserve aux signaux d'elite (etait 50)
+  BONUS_MIN_Q: 75, // 3.26 (decret 20/09) : loterie a partir de Q 75 (etait 88). Mise et levier montent de Q75 a BONUS_Q_TOP.
   BONUS_STAKE_MIN_USD: 20,      // 3.19 : 25 -> 20 (mise lineaire sur Q)
   BONUS_STAKE_MAX_USD: 50,
   BONUS_LEV_MIN: 8,             // 3.19 : levier lineaire sur Q, x8 a BONUS_MIN_Q...
@@ -1968,11 +2054,14 @@ function sizing(signal, symbol) {
   const qv = signal.quality || 0;
   // 3.22 FUSION : la mise DECOULE du risque (stop 5%), modulee par Q.
   if (STRAT.SL_MODE === 'fixe') {
-    let mult = STRAT.RISK_MULT_BY_Q[STRAT.RISK_MULT_BY_Q.length - 1].mult;
-    for (const t of STRAT.RISK_MULT_BY_Q) if (qv >= t.q) { mult = t.mult; break; }
-    const notionnel = (state.capital * STRAT.RISK_CAP_PCT * mult) / STRAT.SL_FIXED_PCT;
-    const lv = levForQuality(qv);
-    return { stake: Math.max(5, Math.floor((notionnel / lv) * 100) / 100), lev: lv };
+    // 3.24 : le risque est un MONTANT en dollars, pas un % d un capital fige.
+    // notionnel = risque / stop ; le levier est plafonne pour que la mise
+    // reste >= MIN_STAKE_USD (decret 20/09 : mise minimum 100$).
+    // 3.26 : la mise reste au minimum impose (100$) et le LEVIER suit la note.
+    // La position vaut donc 100$ x levier, et la perte pleine 12% de cette position.
+    const lv = Math.max(1, levForQuality(qv));
+    const stakeMin = Math.max(STRAT.MIN_STAKE_USD, STRAT.RISK_USD / (STRAT.SL_FIXED_PCT * lv));
+    return { stake: Math.floor(stakeMin * 100) / 100, lev: lv };
   }
   if (qv >= STRAT.Q_BOOST) {
     stake = smax * (STRAT.BOOST_REF_STAKE / STRAT.BOOST_REF_PALIER_MAX); // palier 1 : 200$
@@ -2989,9 +3078,13 @@ function managePosition(symbol) {
   // 3.22 FUSION : TRAILING CHAMPION — arme a +TRAIL_ARM_PX de prix, puis ferme
   // TRAIL_PX sous le pic. Aucun partiel : le gagnant court jusqu'au trailing.
   if (STRAT.SL_MODE === 'fixe') {
-    if ((pos.peakPnl || 0) >= STRAT.TRAIL_ARM_PX) {
-      const floorPx = (pos.peakPnl || 0) - STRAT.TRAIL_PX;
-      if (pnlPct <= floorPx) { closePos(symbol, pnlPct > 0 ? 'TRAIL-CHAMPION' : 'TRAIL-BE'); return; }
+    // 3.24 : en mode 'R' le trailing s arme a TRAIL_ARM_R x R (2R = +24$) puis
+    // rend au maximum TRAIL_GIVEBACK_R x R depuis le pic. Aucune limite de duree.
+    const armR = STRAT.TRAIL_MODE === 'R' ? STRAT.TRAIL_ARM_R * rPct : STRAT.TRAIL_ARM_PX;
+    const backR = STRAT.TRAIL_MODE === 'R' ? STRAT.TRAIL_GIVEBACK_R * rPct : STRAT.TRAIL_PX;
+    if ((pos.peakPnl || 0) >= armR) {
+      const floorPx = (pos.peakPnl || 0) - backR;
+      if (pnlPct <= floorPx) { closePos(symbol, pnlPct > 0 ? 'TRAIL-SWING' : 'TRAIL-BE'); return; }
     }
   }
 
@@ -3009,7 +3102,7 @@ function managePosition(symbol) {
   // Time-stop révisé (backtest) : le time-stop "stagnant" est DÉSACTIVÉ (0 = le SL seul gère) ;
   // un trade qui travaille (trailing armé) est borné à 24h pour laisser courir les gagnants.
   const trailingArmed = STRAT.SL_MODE === 'fixe'
-    ? (pos.peakPnl || 0) >= STRAT.TRAIL_ARM_PX     // 3.22 : "travaille" = trailing arme
+    ? (pos.peakPnl || 0) >= (STRAT.TRAIL_MODE === 'R' ? STRAT.TRAIL_ARM_R * (pos.rPct || STRAT.SL_FIXED_PCT) : STRAT.TRAIL_ARM_PX) // 3.24
     : pos.partialDone === true;                     // 3.13a : "travaille" = partiel pris
   const timeLimit = trailingArmed ? STRAT.TIME_STOP_WORKING_MS : STRAT.TIME_STOP_STALE_MS;
   // timeLimit=0 -> time-stop DÉSACTIVÉ pour cet état (le trade n'est pas coupé par le temps).
@@ -3757,7 +3850,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
   <div class="head">
     <span class="logo">CryptoSignal<span class="c">AI</span> · Multi</span>
-    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.23 - FUSION Champion×R · 90 sym · 8 pos <span style="opacity:.6;font-weight:600">· backtest WR 65.3% · +0.06R/trade</span></span>
+    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.26 - SWING 25 cryptos · 25 sym · 6 pos <span style="opacity:.6;font-weight:600">· note min 60 · levier x2-x7 selon note</span></span>
     <span id="mode" class="badge net">TESTNET</span>
     <span id="run" class="badge off">PAUSE</span>
   </div>
@@ -3860,7 +3953,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     if($('toggleRelax'))$('toggleRelax').textContent='🔧 Assoupli: '+(s.strat&&s.strat.relaxOn?'ON':'OFF');
     if($('toggleFloor'))$('toggleFloor').textContent='🎯 Plancher 4/h: '+(s.strat&&s.strat.floorOn?'ON':'OFF');
     if($('toggleBonus')){var bs=s.bonusStats||{count:0,wins:0,losses:0,net:0};$('toggleBonus').textContent='🎰 Bonus: '+(s.strat&&s.strat.bonusOn?'ON':'OFF')+(bs.count?' ('+bs.wins+'W/'+bs.losses+'L '+(bs.net>=0?'+':'')+bs.net.toFixed(0)+'$)':'');}
-    $('stratline').textContent='3.23-FUSION Champion×R · risque 1.8%/trade · stop 5% fixe · trailing +1.2% puis −1.5% du pic · AUCUN partiel · note min 45 (55 en range) · plafond volatilité 3%/h · 8 positions · mise = risque 1.2% modulé par Q · gel FOMC T−25/T+35 · plancher OFF · backtest juin-août 2026 : WR 65.3%, +0.06R/trade (août en aveugle)';
+    $('stratline').textContent='3.26-SWING 25 cryptos · stop 12% fixe · trailing armé à +12% (+1R) puis −3% du pic · AUCUN partiel · aucune limite de durée · note min 60 · loterie Q≥75 · levier x2 (60-69) / x3 (70-78) / x5 (79-85) / x7 (86+) · mise 100$ · perte pleine 24$ à 84$ selon le levier · 6 positions · gel FOMC T−25/T+35';
       if($('connInfo')){
         // 3.14e : "Connecté" ne signifiait que "clé reçue". Si Binance la REFUSE,
         // on le dit en rouge — c'est une panne totale, pas un detail.
@@ -4059,8 +4152,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // DÉMARRAGE
 // ==================================================================
 async function start() {
-  logLine(`\u{1F680} Itachi — SERVEUR 3.23-FUSION Champion×R (risque 1.8%/trade / stop 5% fixe / trailing Champion / zero partiel / note min 45-55 / plafond volatilite 3%/h / 8 positions / loterie Q70+ 20-50$ x8-20 / grosses mises x3-5 / fix investi partiel / gel FOMC 25/35 / partiel +1R / gagnants 48h / levier x3-6 / mise indexee sur Q : Q>=80 200$ x3-5 proportionnelle au palier, Q<60 x0.5 / plancher OFF / gel FOMC / reserve de marge pour les hauts Q / pleine mise 110-170$ puis residuelles 30/20/10$ / 10 slots / univers 90 / post-mortem par trade / trail post-partiel 1R : le break-even redevient le plancher / tickSize / prix d'entree REEL / respect du ban IP / precisions garanties / autotest de connexion / zero cooldown sur panne d'auth / nettoyage cles / palier 1 supprime / palier affiche / chien de garde stop natif / anti-fantomes : confirmation 2x + age min 20s + verrou d'entree + P&L reel Binance — decret Calvin 03/09) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
-  logLine(`\u{1F4C8} 3.23-FUSION — LOTERIE Q>=${STRAT.BONUS_MIN_Q} ${STRAT.BONUS_STAKE_MIN_USD}-${STRAT.BONUS_STAKE_MAX_USD}$ x${STRAT.BONUS_LEV_MIN}-${STRAT.BONUS_LEV_MAX} — partiel RANGE +${STRAT.RANGE_PARTIAL_AT_R}R — gagnants ${STRAT.TIME_STOP_WORKING_MS / 3600000}h — MISE Q : Q>=${STRAT.Q_BOOST} -> ${STRAT.BOOST_REF_STAKE}$ au palier 1 (x${STRAT.BOOST_LEV_MIN}-${STRAT.BOOST_LEV_MAX}), Q<${STRAT.Q_WEAK} -> x${STRAT.WEAK_STAKE_FRAC} — plancher ${STRAT.FLOOR_ENABLED ? 'ON' : 'OFF'} — gel macro ${STRAT.MACRO_EVENTS.length} evenement(s) — RESERVE : ${STRAT.PREMIUM_RESERVE_SLOTS} pleine(s) mise(s) gardee(s) pour les signaux Q\u2265${STRAT.Q_PREMIUM} (reserve decroissante : elle fond des qu'une position premium s'ouvre) — 10 slots : PLEINE mise de palier (110-170$) tant que la marge suit, puis mises RESIDUELLES ${STRAT.RESIDUAL_STAKES.join('/')}$ selon la marge restante (garde MIN_NOTIONAL active) — univers ${STRAT.CORE_SYMBOLS.length + STRAT.DYNAMIC_SIZE} cryptos — colonne ANALYSE (post-mortem automatique par trade, aussi dans /stats.csv) — trailing post-partiel 1.0R (au lieu de 0.5R) : le plancher redevient le BREAK-EVEN, les gagnants disposent d'un R entier de respiration — risque inchange — prix/quantites cales sur tickSize et stepSize (fin du -1111 sur les stops) — entry lu sur le FILL REEL Binance (fin des STOP-1R instantanes) — ban IP respecte a la seconde — precisions Binance obligatoires avant toute ouverture (fin du -1111) + rechargement automatique — autotest de connexion (verdict immediat + cause exacte) — aucune ouverture ni cooldown tant que Binance refuse les cles — cles API nettoyees (NFKC + ASCII imprimable seul : fin du -2014) + alerte rouge si Binance refuse — paliers de mise : palier 1 (50-100$) SUPPRIME, plancher a 100-175$ — chien de garde stop natif (re-pose 1x/min si position nue) — anti-fantomes : une fermeture native exige 2 absences consecutives de positionRisk + 20s d'age + aucune entree en vol ; P&L lu sur /fapi/v1/userTrades — partiel : RANGE +1R / tendance +1R / volatil +0.4R — bonus : partiel +15% puis break-even, verrou 6h apres perte — prises partielles enregistrees dans l'historique et /stats.csv — filtre carnet 3:1 — cap 8 positions`);
+  logLine(`\u{1F680} Itachi — SERVEUR 3.26-SWING 25 CRYPTOS (note min 60 / loterie Q75 / levier x2-x7 selon note / stop 12% / TP 12% puis on laisse courir / mise 100$ / zero partiel / note min 45-55 / plafond volatilite 3%/h / 8 positions / loterie Q70+ 20-50$ x8-20 / grosses mises x3-5 / fix investi partiel / gel FOMC 25/35 / partiel +1R / gagnants 48h / levier x3-6 / mise indexee sur Q : Q>=80 200$ x3-5 proportionnelle au palier, Q<60 x0.5 / plancher OFF / gel FOMC / reserve de marge pour les hauts Q / pleine mise 110-170$ puis residuelles 30/20/10$ / 10 slots / univers 90 / post-mortem par trade / trail post-partiel 1R : le break-even redevient le plancher / tickSize / prix d'entree REEL / respect du ban IP / precisions garanties / autotest de connexion / zero cooldown sur panne d'auth / nettoyage cles / palier 1 supprime / palier affiche / chien de garde stop natif / anti-fantomes : confirmation 2x + age min 20s + verrou d'entree + P&L reel Binance — decret Calvin 03/09) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
+  logLine(`\u{1F4C8} 3.26-SWING — LOTERIE Q>=${STRAT.BONUS_MIN_Q} ${STRAT.BONUS_STAKE_MIN_USD}-${STRAT.BONUS_STAKE_MAX_USD}$ x${STRAT.BONUS_LEV_MIN}-${STRAT.BONUS_LEV_MAX} — partiel RANGE +${STRAT.RANGE_PARTIAL_AT_R}R — gagnants ${STRAT.TIME_STOP_WORKING_MS / 3600000}h — MISE Q : Q>=${STRAT.Q_BOOST} -> ${STRAT.BOOST_REF_STAKE}$ au palier 1 (x${STRAT.BOOST_LEV_MIN}-${STRAT.BOOST_LEV_MAX}), Q<${STRAT.Q_WEAK} -> x${STRAT.WEAK_STAKE_FRAC} — plancher ${STRAT.FLOOR_ENABLED ? 'ON' : 'OFF'} — gel macro ${STRAT.MACRO_EVENTS.length} evenement(s) — RESERVE : ${STRAT.PREMIUM_RESERVE_SLOTS} pleine(s) mise(s) gardee(s) pour les signaux Q\u2265${STRAT.Q_PREMIUM} (reserve decroissante : elle fond des qu'une position premium s'ouvre) — 10 slots : PLEINE mise de palier (110-170$) tant que la marge suit, puis mises RESIDUELLES ${STRAT.RESIDUAL_STAKES.join('/')}$ selon la marge restante (garde MIN_NOTIONAL active) — univers ${STRAT.CORE_SYMBOLS.length + STRAT.DYNAMIC_SIZE} cryptos — colonne ANALYSE (post-mortem automatique par trade, aussi dans /stats.csv) — trailing post-partiel 1.0R (au lieu de 0.5R) : le plancher redevient le BREAK-EVEN, les gagnants disposent d'un R entier de respiration — risque inchange — prix/quantites cales sur tickSize et stepSize (fin du -1111 sur les stops) — entry lu sur le FILL REEL Binance (fin des STOP-1R instantanes) — ban IP respecte a la seconde — precisions Binance obligatoires avant toute ouverture (fin du -1111) + rechargement automatique — autotest de connexion (verdict immediat + cause exacte) — aucune ouverture ni cooldown tant que Binance refuse les cles — cles API nettoyees (NFKC + ASCII imprimable seul : fin du -2014) + alerte rouge si Binance refuse — paliers de mise : palier 1 (50-100$) SUPPRIME, plancher a 100-175$ — chien de garde stop natif (re-pose 1x/min si position nue) — anti-fantomes : une fermeture native exige 2 absences consecutives de positionRisk + 20s d'age + aucune entree en vol ; P&L lu sur /fapi/v1/userTrades — partiel : RANGE +1R / tendance +1R / volatil +0.4R — bonus : partiel +15% puis break-even, verrou 6h apres perte — prises partielles enregistrees dans l'historique et /stats.csv — filtre carnet 3:1 — cap 8 positions`);
   if (!API_KEY || !API_SECRET) logLine('\u26A0\uFE0F Aucune cle — choisis TESTNET/MAINNET dans le dashboard, colle tes cles et clique 🔐 Connecter.');
   else logLine(`🔐 Cles trouvees en variables d'environnement — mode ${MODE.toUpperCase()} pre-connecte (reconnexion auto post-redeploiement).`);
 
