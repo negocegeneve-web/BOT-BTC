@@ -1,5 +1,86 @@
 /* ============================================================
- *  SERVEUR 3.26 - SWING 25 CRYPTOS  (levier gradue par note)
+ *  SERVEUR 3.29 - REMISE A L ECHELLE DU COMPTE (mise 50$, levier <= x4)
+ *  ------------------------------------------------------------
+ *  Compte reel tombe a ~434$ : la 3.28 demandait 600$ de marge pour 6
+ *  positions a 100$ et risquait jusqu a 84$ par trade (19% du capital).
+ *  DEUX OPTIONS APPLIQUEES (decret Calvin 23/09) :
+ *    1. MIN_STAKE_USD 100$ -> 50$   : 6 positions = 300$ de marge.
+ *    2. LEV_BY_Q plafonne a x4      : Q60-69 x2 · Q70-78 x3 · Q79+ x4.
+ *  Perte pleine par trade (stop 12% du prix) :
+ *    x2 -> position 100$ -> -12$      x3 -> 150$ -> -18$
+ *    x4 -> position 200$ -> -24$   (etait -84$ a x7 en 3.28)
+ *  Kill switch -25% : ~9 pertes a x4 au lieu de 1.3 en 3.28.
+ *
+ *  QUESTION CALVIN : "si on refuse au-dessus de 2%/h, plus aucune chance
+ *  de gros trade ?" — BACKTEST, 25 cryptos, juin-aout 2026, perte de
+ *  reference 12$ :
+ *    plafond 1.5%/h : 27 trades · WR 44% · meilleur +17$ · total -45$
+ *    plafond 2.0%/h : 24 trades · WR 58% · meilleur +23$ · total +45$  <-- meilleur
+ *    plafond 3.0%/h : 36 trades · WR 47% · meilleur +19$ · total -26$
+ *    aucun plafond  : 46 trades · WR 50% · meilleur +19$ · total -17$
+ *  Reponse : NON. Sans plafond le meilleur trade tombe a +19$, avec le
+ *  plafond a 2% il monte a +23$. Les gros gains ne viennent PAS de la
+ *  volatilite du symbole mais de la LARGEUR DU TRAILING :
+ *    arme +1.0R / rend 0.25R : esperance +1.88$/trade (retenu)
+ *    arme +1.0R / rend 0.50R : meilleur trade +28$ mais esperance +0.96$
+ *    arme +1.5R / rend 0.75R : 2 trades >=20$, esperance +1.52$
+ *  Pour viser plus gros : TRAIL_GIVEBACK_R a 0.5, au prix de l esperance.
+ *  A la nouvelle echelle (mise 50$ x4 = 200$ de position), les memes
+ *  multiples de R valent le DOUBLE en dollars : un +2R = +48$, un +3R = +72$.
+ *
+ *  HISTORIQUE 3.28 - FIX STOP REEL 12% + PLAFOND VOLATILITE 2%/h
+ *  ------------------------------------------------------------
+ *  BUG TROUVE SUR LE LIVE DU 23/09 (version 3.26, 40 sorties) :
+ *  les stops ne tombaient PAS a 12% mais a ~7.2% — ZETA -6.28%,
+ *  LSK -7.30%, BCH -7.29%, 1000PEPE -7.27%, DOGE -6.97%.
+ *  CAUSE : le MODE VOLATIL de la 3.13e (1R > VOL_R_PCT 5% -> stop
+ *  ressere a VOL_STOP_R 0.6R) se declenchait a CHAQUE trade depuis que
+ *  le stop decrete vaut 12%. Le stop reel etait donc 40% plus serre que
+ *  demande, donc touche beaucoup plus souvent : c est ce qui a produit
+ *  les -29.40$ et -28.17$ du 23/09.
+ *  CORRECTIF : le mode volatil ne s applique plus quand SL_MODE = 'fixe'
+ *  (helper isVolMode()). En stop fixe, 12% veut dire 12%.
+ *    x2 : perte pleine 24$ (etait 14$)   x3 : 36$ (etait 22$)
+ *    x4 : perte pleine 48$ (etait 29$)   x7 : 84$ (etait 50$)
+ *  ATTENTION : les pertes deviennent donc PLUS GROSSES qu observees,
+ *  conformement au decret du 20/09 — mais moins frequentes.
+ *
+ *  2e CHANGEMENT : VOLCAP_ATR_PCT 3% -> 2%/h. Les 5 stops du 23/09 sont
+ *  tous partis sur des entrees a 1.33 / 2.36 / 2.75 / 2.92 %/h, donc juste
+ *  SOUS l ancien plafond. A 2%/h, 3 de ces 5 entrees n auraient pas eu lieu.
+ *
+ *  RAPPEL DU LIVE 23/09, sorties par type :
+ *    TRAIL-SWING (le bot decide)  2 sorties  +12.47$  (moyenne +6.23$)
+ *    MANUEL (fermetures a la main) 33 sorties  +0.83$  (moyenne +0.03$)
+ *    SL NATIF                       5 sorties  -92.08$
+ *  Sans les 5 stops : +13.30$. Les 33 fermetures manuelles ont coupe les
+ *  gagnants a +0.04R a +0.32R, la ou le trailing les laissait aller a +1.35R.
+ *
+ *  HISTORIQUE 3.27 - SWING 25 + LOTERIE BRIDEE  (decret Calvin 20/09)
+ *  ------------------------------------------------------------
+ *  DECRET : loterie reactivee, stop a 15% du MONTANT DE LA MISE,
+ *  mise bonus plafonnee a 50$, take-profit du bonus INCHANGE.
+ *
+ *  - BONUS_MAX_LOSS_STAKE 0.45 -> 0.15 : quel que soit le levier, un ticket
+ *    perdant coute au maximum 15% de sa mise (3$ sur 20$, 7.50$ sur 50$).
+ *  - BONUS_STAKE_MIN/MAX inchanges : 20$ a Q75 -> 50$ a Q90 (plafond respecte).
+ *  - TP bonus inchange : partiel a +15% de mise (moitie), trailing arme a
+ *    +27% de mise puis rend 30% du pic, aucun plafond de gain.
+ *  - BONUS_ENABLED reste true dans le code ; l interrupteur du dashboard
+ *    doit etre sur ON pour que la loterie tourne.
+ *
+ *  CE QUE LE STOP A 15% IMPLIQUE, EN PRIX (calcul : 15% / levier) :
+ *    Q75  x8  -> stop a -1.88% de prix     Q80 x12 -> stop a -1.25%
+ *    Q85  x16 -> stop a -0.94%             Q90 x20 -> stop a -0.75%
+ *  A x20, 0.75% de prix c est le bruit d une heure sur une alt : le ticket
+ *  sera coupe tres souvent avant d avoir la place de courir. Le jackpot de
+ *  juillet (+232$) avait ete obtenu SANS stop, en x15, avec des pertes en
+ *  face de -103$ et -106$ (7 tickets, net -93$). Le stop a 15% supprime ces
+ *  trous, mais reduit aussi fortement la probabilite d un gros gain.
+ *  Pour rendre de l air au ticket sans rouvrir le trou : BONUS_MAX_LOSS_STAKE
+ *  a 0.30 (stop 1.5% de prix a x20) ou baisser BONUS_LEV_MAX.
+ *
+ *  HISTORIQUE 3.26 - SWING 25 CRYPTOS  (levier gradue par note)
  *  ------------------------------------------------------------
  *  DECRETS CALVIN 20/09 : note minimum 60 · loterie Q >= 75 ·
  *  levier x2 (Q60-69) / x3 (Q70-78) / x5 (Q79-85) / x7 (Q86-100).
@@ -64,7 +145,7 @@
  *  REGLAGE RETENU (backtest klines 1h Binance, 10 majors, juin-aout 2026,
  *  frais 0.05%/cote, aout en aveugle) :
  *    univers 10 majors · stop FIXE 3% · trailing arme a +2R puis 0.5R sous le pic
- *    note min 45 (55 en range) · plafond volatilite 3%/h · 6 positions · zero partiel
+ *    note min 45 (55 en range) · plafond volatilite 2%/h · 6 positions · zero partiel
  *    141 trades · WR 36.2% · gain moyen +25.5$ · perte moyenne -12.2$
  *    esperance +1.43$/trade · total +202$ sur 3 mois · meilleur trade +52$
  *
@@ -1070,13 +1151,12 @@ const STRAT = {
   TAKER_MAX_DRIFT: 0.003, // 0.3% d'écart max pour tolérer un fallback taker
 
   // --- Levier x2 -> x5 indexe sur la qualite ---
-  LEV_BY_Q: [                  // 3.26 (decret Calvin 20/09) : levier gradue par note
-    { q: 86, lev: 7 },         //   Q86-100 -> x7 (position 700$, perte pleine 84$)
-    { q: 79, lev: 5 },         //   Q79-85  -> x5 (position 500$, perte pleine 60$)
-    { q: 70, lev: 3 },         //   Q70-78  -> x3 (position 300$, perte pleine 36$)
-    { q: 0,  lev: 2 },         //   Q60-69  -> x2 (position 200$, perte pleine 24$)
+  LEV_BY_Q: [                  // 3.29 (decret 23/09) : levier plafonne a x4
+    { q: 79, lev: 4 },         //   Q79-100 -> x4 (position 200$, perte pleine 24$)
+    { q: 70, lev: 3 },         //   Q70-78  -> x3 (position 150$, perte pleine 18$)
+    { q: 0,  lev: 2 },         //   Q60-69  -> x2 (position 100$, perte pleine 12$)
   ],
-  LEV_MAX: 7,
+  LEV_MAX: 4,
 
   Q_FOR_MAX_STAKE: 80,  // Q>=80 -> mise max 280$ ; interpolation lineaire depuis 80$
 
@@ -1090,11 +1170,11 @@ const STRAT = {
   TRAIL_ARM_R: 1.0,              // 3.25 (decret 20/09) : TP a 12% = +1R : le trailing s ARME la, mais rien n est ferme — on laisse courir.
   TRAIL_GIVEBACK_R: 0.25,        // 3.25 : apres armement, on rend au maximum 0.25R (3% de prix) depuis le pic (meilleure variante testee).
   RISK_USD: 12,                  // 3.24 (decret Calvin 20/09) : perte pleine visee en DOLLARS (fourchette demandee 10-15$)
-  MIN_STAKE_USD: 100,            // 3.24 : mise minimum imposee -> plafonne le levier a notionnel/100
+  MIN_STAKE_USD: 50,             // 3.29 (decret 23/09) : mise minimum 50$ (etait 100$) — 6 positions = 300$ de marge sur un compte de ~434$.
   TRAIL_ARM_PX: 0.012,           // (3.22, utilise seulement si TRAIL_MODE='px')
   TRAIL_PX: 0.015,               // (3.22)
   PARTIAL_ENABLED: false,        // aucun partiel : on laisse courir (ablation : le partiel coute)
-  VOLCAP_ATR_PCT: 0.03,          // symbole refuse si ATR(14) 1h > 3%/h
+  VOLCAP_ATR_PCT: 0.02,          // 3.28 : 3% -> 2%/h. Les 5 stops du 23/09 venaient d entrees a 1.33-2.92%/h, toutes sous l ancien plafond.
   Q_MIN_ENTRY: 60,               // 3.26 (decret 20/09) : note minimum d entree 60 (etait 75)
   Q_MIN_ENTRY_RANGE: 60,         // 3.26 (decret 20/09) : 60 aussi en RANGE
   // --- 3.18 MISE INDEXEE SUR Q (decret Calvin 15/09) — actif si SL_MODE='atr' ---
@@ -1191,11 +1271,11 @@ const STRAT = {
   BONUS_INTERVAL_MS: 3600000,   // 1 bonus par heure maximum
   BONUS_MIN_Q: 75, // 3.26 (decret 20/09) : loterie a partir de Q 75 (etait 88). Mise et levier montent de Q75 a BONUS_Q_TOP.
   BONUS_STAKE_MIN_USD: 20,      // 3.19 : 25 -> 20 (mise lineaire sur Q)
-  BONUS_STAKE_MAX_USD: 50,
+  BONUS_STAKE_MAX_USD: 50,      // 3.27 (decret Calvin 20/09) : mise bonus plafonnee a 50$ par ticket (confirme)
   BONUS_LEV_MIN: 8,             // 3.19 : levier lineaire sur Q, x8 a BONUS_MIN_Q...
   BONUS_LEV_MAX: 20,            // ...x20 a BONUS_Q_TOP
   BONUS_Q_TOP: 90,              // Q ou mise et levier atteignent leur maximum
-  BONUS_MAX_LOSS_STAKE: 0.45,   // 3.19 : SL prix = min(BONUS_SL_PCT ; 45%/levier) -> perte max ~45% de la mise
+  BONUS_MAX_LOSS_STAKE: 0.15,   // 3.27 (decret Calvin 20/09) : stop = 15% de la MISE, quel que soit le levier (SL prix = 15%/levier). Etait 0.45.
   BONUS_SL_PCT: 0.05,           // decret Calvin 26/07 : SL -5% PRIX sur le bonus (= ~-45% de la mise a x9, etait ~-75% a x15). Fin du "sans SL" : en marge cross, pas de liquidation-plancher -> perte illimitee constatee.
   BONUS_TP_ARM_STAKE: 0.27,     // decret Calvin 30/08 : 1.00 -> 0.27. A x9, +100% de mise exigeait +11.1% de PRIX (quasi inatteignable) : le bonus n'avait aucune sortie gagnante realiste. +27% de mise = +3% de prix.
   BONUS_PARTIAL_AT_STAKE: 0.15, // 3.14a : a +15% de la mise (+1.67% de prix a x9) -> encaisse BONUS_PARTIAL_FRAC et passe le stop au break-even
@@ -2007,6 +2087,13 @@ function qRamp(q, qLo, qHi) {
   return qHi > qLo ? Math.max(0, Math.min(1, ((q || 0) - qLo) / (qHi - qLo))) : 1;
 }
 
+// 3.28 : le MODE VOLATIL (stop ressere a 0.6R quand 1R > 5%) n a de sens
+// qu avec un stop calcule sur l ATR. En stop FIXE, il detournait le decret
+// (12% devenait 7.2%) : on le neutralise.
+function isVolMode(rPct) {
+  return STRAT.SL_MODE !== 'fixe' && rPct > STRAT.VOL_R_PCT;
+}
+
 // Décide mise + levier, proportionnels à la qualité du signal (pleines mises :
 // le bridage "comblement" a été supprimé, il pénalisait les meilleurs signaux).
 function sizing(signal, symbol) {
@@ -2637,13 +2724,13 @@ async function tryOpen(symbol, signal) {
     side: signal.side, entry, qty, stake, lev, quality: signal.quality,
     entryFill,
     // 3.13e MODE VOLATIL : 1R > 5% -> stop initial ressere a -0.6R (natif inclus).
-    volMode: exits.rPct > STRAT.VOL_R_PCT,
-    slPct: (exits.rPct > STRAT.VOL_R_PCT) ? exits.rPct * STRAT.VOL_STOP_R : exits.slPct,
+    volMode: isVolMode(exits.rPct),
+    slPct: isVolMode(exits.rPct) ? exits.rPct * STRAT.VOL_STOP_R : exits.slPct,
     tpPct: exits.tpPct,
     rPct: exits.rPct, partialDone: false, // 3.13a cadre R
     sl: signal.side === 'BUY'
-      ? entry * (1 - ((exits.rPct > STRAT.VOL_R_PCT) ? exits.rPct * STRAT.VOL_STOP_R : exits.slPct))
-      : entry * (1 + ((exits.rPct > STRAT.VOL_R_PCT) ? exits.rPct * STRAT.VOL_STOP_R : exits.slPct)),
+      ? entry * (1 - (isVolMode(exits.rPct) ? exits.rPct * STRAT.VOL_STOP_R : exits.slPct))
+      : entry * (1 + (isVolMode(exits.rPct) ? exits.rPct * STRAT.VOL_STOP_R : exits.slPct)),
     tp: signal.side === 'BUY' ? entry * (1 + exits.tpPct) : entry * (1 - exits.tpPct),
     openedAt: now, peakPnl: 0, maePct: 0, scaleDone: [],
     // 3.15 : DOSSIER DE THESE fige a l'ouverture. C'est la matiere premiere du
@@ -3356,8 +3443,8 @@ async function _reconcileInner() {
         S.position = {
           side: r.side, entry: r.entry, qty: r.qty, stake, lev: r.lev,
           quality: 0, entryFill: 'taker',
-          volMode: exits.rPct > STRAT.VOL_R_PCT, // 3.13e (adoption)
-          slPct: (exits.rPct > STRAT.VOL_R_PCT) ? exits.rPct * STRAT.VOL_STOP_R : exits.slPct,
+          volMode: isVolMode(exits.rPct), // 3.13e (adoption) — 3.28 : neutralise en stop fixe
+          slPct: isVolMode(exits.rPct) ? exits.rPct * STRAT.VOL_STOP_R : exits.slPct,
           tpPct: exits.tpPct,
           rPct: exits.rPct, partialDone: false, // 3.13a cadre R (adoption)
           sl: r.side === 'BUY'
@@ -3850,7 +3937,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
   <div class="head">
     <span class="logo">CryptoSignal<span class="c">AI</span> · Multi</span>
-    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.26 - SWING 25 cryptos · 25 sym · 6 pos <span style="opacity:.6;font-weight:600">· note min 60 · levier x2-x7 selon note</span></span>
+    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.29 - SWING 25 cryptos · 25 sym · 6 pos <span style="opacity:.6;font-weight:600">· mise 50$ · levier ≤x4 · perte 12-24$</span></span>
     <span id="mode" class="badge net">TESTNET</span>
     <span id="run" class="badge off">PAUSE</span>
   </div>
@@ -3953,7 +4040,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     if($('toggleRelax'))$('toggleRelax').textContent='🔧 Assoupli: '+(s.strat&&s.strat.relaxOn?'ON':'OFF');
     if($('toggleFloor'))$('toggleFloor').textContent='🎯 Plancher 4/h: '+(s.strat&&s.strat.floorOn?'ON':'OFF');
     if($('toggleBonus')){var bs=s.bonusStats||{count:0,wins:0,losses:0,net:0};$('toggleBonus').textContent='🎰 Bonus: '+(s.strat&&s.strat.bonusOn?'ON':'OFF')+(bs.count?' ('+bs.wins+'W/'+bs.losses+'L '+(bs.net>=0?'+':'')+bs.net.toFixed(0)+'$)':'');}
-    $('stratline').textContent='3.26-SWING 25 cryptos · stop 12% fixe · trailing armé à +12% (+1R) puis −3% du pic · AUCUN partiel · aucune limite de durée · note min 60 · loterie Q≥75 · levier x2 (60-69) / x3 (70-78) / x5 (79-85) / x7 (86+) · mise 100$ · perte pleine 24$ à 84$ selon le levier · 6 positions · gel FOMC T−25/T+35';
+    $('stratline').textContent='3.29-SWING 25 cryptos · stop 12% fixe · trailing armé à +12% (+1R) puis −3% du pic · AUCUN partiel · aucune limite de durée · note min 60 · loterie Q≥75, mise ≤50$, stop 15% de la mise · levier x2 (60-69) / x3 (70-78) / x4 (79+) · mise 50$ · perte pleine 12$ à 24$ selon le levier · 6 positions · gel FOMC T−25/T+35';
       if($('connInfo')){
         // 3.14e : "Connecté" ne signifiait que "clé reçue". Si Binance la REFUSE,
         // on le dit en rouge — c'est une panne totale, pas un detail.
@@ -4152,8 +4239,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // DÉMARRAGE
 // ==================================================================
 async function start() {
-  logLine(`\u{1F680} Itachi — SERVEUR 3.26-SWING 25 CRYPTOS (note min 60 / loterie Q75 / levier x2-x7 selon note / stop 12% / TP 12% puis on laisse courir / mise 100$ / zero partiel / note min 45-55 / plafond volatilite 3%/h / 8 positions / loterie Q70+ 20-50$ x8-20 / grosses mises x3-5 / fix investi partiel / gel FOMC 25/35 / partiel +1R / gagnants 48h / levier x3-6 / mise indexee sur Q : Q>=80 200$ x3-5 proportionnelle au palier, Q<60 x0.5 / plancher OFF / gel FOMC / reserve de marge pour les hauts Q / pleine mise 110-170$ puis residuelles 30/20/10$ / 10 slots / univers 90 / post-mortem par trade / trail post-partiel 1R : le break-even redevient le plancher / tickSize / prix d'entree REEL / respect du ban IP / precisions garanties / autotest de connexion / zero cooldown sur panne d'auth / nettoyage cles / palier 1 supprime / palier affiche / chien de garde stop natif / anti-fantomes : confirmation 2x + age min 20s + verrou d'entree + P&L reel Binance — decret Calvin 03/09) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
-  logLine(`\u{1F4C8} 3.26-SWING — LOTERIE Q>=${STRAT.BONUS_MIN_Q} ${STRAT.BONUS_STAKE_MIN_USD}-${STRAT.BONUS_STAKE_MAX_USD}$ x${STRAT.BONUS_LEV_MIN}-${STRAT.BONUS_LEV_MAX} — partiel RANGE +${STRAT.RANGE_PARTIAL_AT_R}R — gagnants ${STRAT.TIME_STOP_WORKING_MS / 3600000}h — MISE Q : Q>=${STRAT.Q_BOOST} -> ${STRAT.BOOST_REF_STAKE}$ au palier 1 (x${STRAT.BOOST_LEV_MIN}-${STRAT.BOOST_LEV_MAX}), Q<${STRAT.Q_WEAK} -> x${STRAT.WEAK_STAKE_FRAC} — plancher ${STRAT.FLOOR_ENABLED ? 'ON' : 'OFF'} — gel macro ${STRAT.MACRO_EVENTS.length} evenement(s) — RESERVE : ${STRAT.PREMIUM_RESERVE_SLOTS} pleine(s) mise(s) gardee(s) pour les signaux Q\u2265${STRAT.Q_PREMIUM} (reserve decroissante : elle fond des qu'une position premium s'ouvre) — 10 slots : PLEINE mise de palier (110-170$) tant que la marge suit, puis mises RESIDUELLES ${STRAT.RESIDUAL_STAKES.join('/')}$ selon la marge restante (garde MIN_NOTIONAL active) — univers ${STRAT.CORE_SYMBOLS.length + STRAT.DYNAMIC_SIZE} cryptos — colonne ANALYSE (post-mortem automatique par trade, aussi dans /stats.csv) — trailing post-partiel 1.0R (au lieu de 0.5R) : le plancher redevient le BREAK-EVEN, les gagnants disposent d'un R entier de respiration — risque inchange — prix/quantites cales sur tickSize et stepSize (fin du -1111 sur les stops) — entry lu sur le FILL REEL Binance (fin des STOP-1R instantanes) — ban IP respecte a la seconde — precisions Binance obligatoires avant toute ouverture (fin du -1111) + rechargement automatique — autotest de connexion (verdict immediat + cause exacte) — aucune ouverture ni cooldown tant que Binance refuse les cles — cles API nettoyees (NFKC + ASCII imprimable seul : fin du -2014) + alerte rouge si Binance refuse — paliers de mise : palier 1 (50-100$) SUPPRIME, plancher a 100-175$ — chien de garde stop natif (re-pose 1x/min si position nue) — anti-fantomes : une fermeture native exige 2 absences consecutives de positionRisk + 20s d'age + aucune entree en vol ; P&L lu sur /fapi/v1/userTrades — partiel : RANGE +1R / tendance +1R / volatil +0.4R — bonus : partiel +15% puis break-even, verrou 6h apres perte — prises partielles enregistrees dans l'historique et /stats.csv — filtre carnet 3:1 — cap 8 positions`);
+  logLine(`\u{1F680} Itachi — SERVEUR 3.29-SWING 25 CRYPTOS (mise 50$ / levier <=x4 / perte 12-24$ / fix stop 12% reel / volatilite <=2%/h / note min 60 / loterie Q75 mise<=50$ stop 15% de la mise / levier x2-x7 selon note / stop 12% / TP 12% puis on laisse courir / mise 100$ / zero partiel / note min 45-55 / plafond volatilite 2%/h / 8 positions / loterie Q70+ 20-50$ x8-20 / grosses mises x3-5 / fix investi partiel / gel FOMC 25/35 / partiel +1R / gagnants 48h / levier x3-6 / mise indexee sur Q : Q>=80 200$ x3-5 proportionnelle au palier, Q<60 x0.5 / plancher OFF / gel FOMC / reserve de marge pour les hauts Q / pleine mise 110-170$ puis residuelles 30/20/10$ / 10 slots / univers 90 / post-mortem par trade / trail post-partiel 1R : le break-even redevient le plancher / tickSize / prix d'entree REEL / respect du ban IP / precisions garanties / autotest de connexion / zero cooldown sur panne d'auth / nettoyage cles / palier 1 supprime / palier affiche / chien de garde stop natif / anti-fantomes : confirmation 2x + age min 20s + verrou d'entree + P&L reel Binance — decret Calvin 03/09) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
+  logLine(`\u{1F4C8} 3.29-SWING — LOTERIE Q>=${STRAT.BONUS_MIN_Q} ${STRAT.BONUS_STAKE_MIN_USD}-${STRAT.BONUS_STAKE_MAX_USD}$ x${STRAT.BONUS_LEV_MIN}-${STRAT.BONUS_LEV_MAX} — partiel RANGE +${STRAT.RANGE_PARTIAL_AT_R}R — gagnants ${STRAT.TIME_STOP_WORKING_MS / 3600000}h — MISE Q : Q>=${STRAT.Q_BOOST} -> ${STRAT.BOOST_REF_STAKE}$ au palier 1 (x${STRAT.BOOST_LEV_MIN}-${STRAT.BOOST_LEV_MAX}), Q<${STRAT.Q_WEAK} -> x${STRAT.WEAK_STAKE_FRAC} — plancher ${STRAT.FLOOR_ENABLED ? 'ON' : 'OFF'} — gel macro ${STRAT.MACRO_EVENTS.length} evenement(s) — RESERVE : ${STRAT.PREMIUM_RESERVE_SLOTS} pleine(s) mise(s) gardee(s) pour les signaux Q\u2265${STRAT.Q_PREMIUM} (reserve decroissante : elle fond des qu'une position premium s'ouvre) — 10 slots : PLEINE mise de palier (110-170$) tant que la marge suit, puis mises RESIDUELLES ${STRAT.RESIDUAL_STAKES.join('/')}$ selon la marge restante (garde MIN_NOTIONAL active) — univers ${STRAT.CORE_SYMBOLS.length + STRAT.DYNAMIC_SIZE} cryptos — colonne ANALYSE (post-mortem automatique par trade, aussi dans /stats.csv) — trailing post-partiel 1.0R (au lieu de 0.5R) : le plancher redevient le BREAK-EVEN, les gagnants disposent d'un R entier de respiration — risque inchange — prix/quantites cales sur tickSize et stepSize (fin du -1111 sur les stops) — entry lu sur le FILL REEL Binance (fin des STOP-1R instantanes) — ban IP respecte a la seconde — precisions Binance obligatoires avant toute ouverture (fin du -1111) + rechargement automatique — autotest de connexion (verdict immediat + cause exacte) — aucune ouverture ni cooldown tant que Binance refuse les cles — cles API nettoyees (NFKC + ASCII imprimable seul : fin du -2014) + alerte rouge si Binance refuse — paliers de mise : palier 1 (50-100$) SUPPRIME, plancher a 100-175$ — chien de garde stop natif (re-pose 1x/min si position nue) — anti-fantomes : une fermeture native exige 2 absences consecutives de positionRisk + 20s d'age + aucune entree en vol ; P&L lu sur /fapi/v1/userTrades — partiel : RANGE +1R / tendance +1R / volatil +0.4R — bonus : partiel +15% puis break-even, verrou 6h apres perte — prises partielles enregistrees dans l'historique et /stats.csv — filtre carnet 3:1 — cap 8 positions`);
   if (!API_KEY || !API_SECRET) logLine('\u26A0\uFE0F Aucune cle — choisis TESTNET/MAINNET dans le dashboard, colle tes cles et clique 🔐 Connecter.');
   else logLine(`🔐 Cles trouvees en variables d'environnement — mode ${MODE.toUpperCase()} pre-connecte (reconnexion auto post-redeploiement).`);
 
