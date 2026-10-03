@@ -1,5 +1,51 @@
 /* ============================================================
- *  SERVEUR 3.30 - MISE MINIMUM 80$  (decret Calvin 27/09)
+ *  SERVEUR 3.31 - CADENCE  (TP realiste / stop 4% / 24h max / biais marche)
+ *  ------------------------------------------------------------
+ *  CONSTAT CALVIN 03/10, verifie au backtest (klines 1h Binance, 25 cryptos,
+ *  juillet-aout-septembre 2026, frais 0.05%/cote) sur la 3.30 :
+ *    28 trades en 3 MOIS (9/mois) · duree MOYENNE 346h = 14.4 jours ·
+ *    mediane 196h · 68% des trades au-dela de 72h ·
+ *    TP natif a +-35% du prix : touche 0 fois sur 28.
+ *  Les TP a 115 345$ sur BTC ou 499$ sur BNB etaient donc des bornes de
+ *  securite, jamais des objectifs. Le constat etait juste.
+ *
+ *  CONTEXTE MESURE (variation sur le mois) :
+ *    BTC  +7.4% / +24.9% / +6.3%      ETH  +18.3% / +32.3% / +8.7%
+ *    SOL  -1.1% / +41.1% / +14.5%     AVAX -2.4% / +13.2% / +50.3%
+ *  BTC est reste 67% du temps au-dessus de sa EMA200 1h : phase haussiere.
+ *  Effet direct, mesure sur 3 mois a risque constant :
+ *    LONGS seuls   319 trades  -> +1185$
+ *    tout (L+S)    532 trades  ->  +823$
+ *    SHORTS seuls  314 trades  ->  -472$   <-- les shorts coutent
+ *
+ *  QUATRE CHANGEMENTS :
+ *  1. TP NATIF = TP_R x R (3R) au lieu de TP_SOFT_CAP 35% fixe.
+ *     Avec SL 4% : TP a +12% de prix, atteignable. La borne logicielle
+ *     utilise desormais pos.tpPct (le meme), plus la constante 35%.
+ *  2. SL_FIXED_PCT 12% -> 4%. Perte pleine : 6.40$ a x2, 12.80$ a x4
+ *     (mise 80$), soit la fourchette 10-15$ demandee le 20/09.
+ *  3. DUREE MAX 24h sur TOUS les trades (stagnant ET armé). Etait : aucune.
+ *  4. BIAIS MARCHE (BIAS_MODE) adosse a la EMA200 1h de BTC, rafraichie
+ *     toutes les 5 min par un appel REST dedie (250 bougies) :
+ *       'pause' (defaut) : BTC > EMA200 -> LONGS seuls · BTC < EMA200 -> AUCUNE entree
+ *       'long'           : longs seuls en permanence (pari directionnel assume)
+ *       'off'            : comportement 3.30 (les deux sens)
+ *
+ *  BACKTEST DES 3 MODES (SL 4%, TP 3R, trailing 1R/0.25R, 24h max) :
+ *    mode    trades  duree  juillet   aout   septembre   total   pire mois
+ *    long      244    19h    -4.32   +12.05    +4.81    +1172$    -285$
+ *    pause     194    19h    -5.34   +14.33    +2.81     +828$    -283$
+ *    off(L+S)  301    19h    -5.01    +9.17    -0.87     +340$    -426$
+ *  'long' rapporte le plus, mais L ECHANTILLON NE CONTIENT AUCUN MARCHE
+ *  BAISSIER : le backtest ne peut pas mesurer ce que 'long' couterait dans
+ *  un retournement durable. 'pause' coute 344$ sur ces 3 mois et c est le
+ *  prix de cette assurance — d ou le defaut. Une ligne pour changer.
+ *
+ *  JUILLET RESTE NEGATIF dans toutes les versions a haute cadence : serrer
+ *  le stop coupe le signal avant qu il se realise. C est l arbitrage assume
+ *  cadence contre robustesse, pas un defaut de reglage.
+ *
+ *  HISTORIQUE 3.30 - MISE MINIMUM 80$  (decret Calvin 27/09)
  *  ------------------------------------------------------------
  *  UNE SEULE VARIABLE : MIN_STAKE_USD 50$ -> 80$. Tout le reste est
  *  strictement identique a la 3.29 (stop 12% reel, levier <= x4, note min 60,
@@ -1145,7 +1191,7 @@ const STRAT = {
   VOL_STOP_R: 0.6,        // stop initial -0.6R (on ne laisse pas courir -13%)
   VOL_TRAIL_R: 0.5,       // 3.14i (decret 03/09) : 0.25 -> 0.5. Meme logique en mode volatil : le plancher post-partiel passe de +0.15R au break-even.
   PRICE_STALE_MS: 15000,  // 3.13e : prix plus vieux que 15s = gele -> pas de decision logicielle
-  TP_SOFT_CAP: 0.35,    // borne haute indicative +35% (securite, rarement atteinte)
+  TP_SOFT_CAP: 0.35,    // (conserve comme PLAFOND absolu de securite ; le TP reel est TP_R x R depuis la 3.31)
   // Time-stop CONDITIONNEL (Option B) :
   //  - trade qui STAGNE (trailing jamais armé) -> fermé à 2h30 (libère le capital)
   //  - trade qui TRAVAILLE (trailing armé, +1% atteint) -> court jusqu'à 5h30 max
@@ -1157,8 +1203,8 @@ const STRAT = {
   //  - Laisser courir les GAGNANTS est le moteur du rendement -> time-stop working allongé
   //    à 24h (le backtest montrait "plus c'est long, mieux c'est" ; 24h borne la durée max
   //    par prudence en réel sans brider les trades productifs).
-  TIME_STOP_STALE_MS: 0,          // 0 = désactivé (stagnant géré par le stop-loss seul)
-  TIME_STOP_WORKING_MS: 0,       // 3.22 (backtest) : time-stop des gagnants DESACTIVE — on laisse courir. Etait 172800000 (48h) : // 3.19 : 24h -> 48h. Etait 86400000 : // 24h pour un gagnant qui travaille (laisser courir)
+  TIME_STOP_STALE_MS: 86400000,   // 3.31 : 24h max aussi sur un trade qui stagne (etait 0 = desactive).
+  TIME_STOP_WORKING_MS: 86400000, // 3.31 (decret 03/10) : 24h max sur un trade qui travaille (etait 0 = illimite ; duree moyenne constatee 346h).
 
 
   // --- Frais & execution ---
@@ -1188,9 +1234,16 @@ const STRAT = {
   PREMIUM_RESERVE_SLOTS: 2,      // 3.17 : nombre de pleines mises gardees INTOUCHABLES pour les signaux premium. 0 = comportement 3.16 restaure.
   // --- 3.22 FUSION (backtest juin-aout 2026) ---
   SL_MODE: 'fixe',               // 'fixe' = stop 5% (Champion, backteste) | 'atr' = cadre R 3.21
-  SL_FIXED_PCT: 0.12,            // 3.25 (decret 20/09) : stop 12% du prix. Notionnel = RISK_USD/0.12 = 100$ -> mise 100$ a x1, perte pleine 12$.
+  SL_FIXED_PCT: 0.04,            // 3.31 (decret 03/10) : stop 4% du prix (etait 12%). Perte pleine 6.40$ a x2, 12.80$ a x4 sur une mise de 80$.
   TRAIL_MODE: 'R',               // 3.24 : 'R' = trailing en multiples de risque (swing) | 'px' = trailing Champion 3.22
   TRAIL_ARM_R: 1.0,              // 3.25 (decret 20/09) : TP a 12% = +1R : le trailing s ARME la, mais rien n est ferme — on laisse courir.
+  TP_R: 3.0,                     // 3.31 (decret 03/10) : TP natif = 3 x R, soit +12% de prix avec SL 4%. Mettre 0 pour aucun TP natif.
+  // --- 3.31 BIAIS MARCHE : la direction autorisee suit la EMA200 1h de BTC ---
+  BIAS_MODE: 'pause',            // 'pause' = longs seuls en marche haussier, AUCUNE entree en marche baissier (defaut, le plus sur)
+                                 // 'long'  = longs seuls en permanence (le plus rentable sur juil-sept 2026 : +1172$ vs +828$, mais aucun marche baissier dans l echantillon)
+                                 // 'off'   = les deux sens (comportement 3.30 : +340$)
+  MARKET_EMA_SPAN: 200,          // periode de la EMA de reference sur BTC 1h
+  MARKET_KLINE_LIMIT: 250,       // bougies chargees pour la calculer (1 appel REST / 5 min)
   TRAIL_GIVEBACK_R: 0.25,        // 3.25 : apres armement, on rend au maximum 0.25R (3% de prix) depuis le pic (meilleure variante testee).
   RISK_USD: 12,                  // 3.24 (decret Calvin 20/09) : perte pleine visee en DOLLARS (fourchette demandee 10-15$)
   MIN_STAKE_USD: 80,             // 3.30 (decret Calvin 27/09) : mise minimum 80$ (etait 50$). Position = 80$ x levier ; perte pleine = 12% de la position (19.2$ a x2, 28.8$ a x3, 38.4$ a x4).
@@ -1341,6 +1394,7 @@ const state = {
   lastBonusAt: 0,
   log: [],
   consecLosses: 0, // pertes consécutives (coupe-circuit)
+  marketBull: null, marketEma: null, // 3.31 : biais marche (BTC vs EMA200 1h)
   activeSymbols: null,
   universe: [], // univers courant (pour le dashboard)
 };
@@ -1858,6 +1912,30 @@ async function fetchFunding(symbol) {
 // ==================================================================
 // LECTURE DES 50 DERNIÈRES BOUGIES + ANALYSE MTF PAR SYMBOLE
 // ==================================================================
+// 3.31 BIAIS MARCHE. Charge MARKET_KLINE_LIMIT bougies 1h de BTC et compare le
+// dernier prix a sa EMA(MARKET_EMA_SPAN). Un seul appel REST par cycle (5 min).
+// state.marketBull = true -> marche haussier ; null -> indetermine (reseau),
+// auquel cas le filtre se neutralise et ne bloque rien.
+async function refreshMarketBias() {
+  if (STRAT.BIAS_MODE === 'off') { state.marketBull = null; return; }
+  try {
+    const raw = await publicGet(KLINE_BASE, '/fapi/v1/klines', {
+      symbol: 'BTCUSDT', interval: STRAT.TF_MAIN, limit: STRAT.MARKET_KLINE_LIMIT,
+    });
+    const cl = raw.map((c) => +c[4]).filter(Number.isFinite);
+    if (cl.length < 30) return;
+    const k = 2 / (STRAT.MARKET_EMA_SPAN + 1);
+    let e = cl[0];
+    for (let i = 1; i < cl.length; i++) e = cl[i] * k + e * (1 - k);
+    const px = cl[cl.length - 1];
+    const bull = px > e;
+    if (state.marketBull !== bull) {
+      logLine(`\u{1F9ED} BIAIS MARCHE : BTC ${px.toFixed(0)} ${bull ? '>' : '<'} EMA${STRAT.MARKET_EMA_SPAN} ${e.toFixed(0)} — ${bull ? 'HAUSSIER (longs seuls)' : 'BAISSIER'}${!bull && STRAT.BIAS_MODE === 'pause' ? ' : aucune nouvelle entree' : ''}.`);
+    }
+    state.marketBull = bull; state.marketEma = e;
+  } catch (e) { /* silencieux : on garde la derniere valeur connue */ }
+}
+
 async function refreshKlines(symbol) {
   const S = state.sym[symbol];
   if (!S) return;
@@ -2078,7 +2156,9 @@ function computeExits(symbol) {
   // volatilite est fait en amont par VOLCAP_ATR_PCT (pas par la taille du stop).
   if (STRAT.SL_MODE === 'fixe') {
     const r = STRAT.SL_FIXED_PCT;
-    return { slPct: r, tpPct: STRAT.TP_SOFT_CAP, rPct: r, source: 'fixe-5%' };
+    // 3.31 : TP natif = TP_R x R, borne par TP_SOFT_CAP. A SL 4% et TP_R 3 -> +12% de prix.
+    const tp = STRAT.TP_R > 0 ? Math.min(STRAT.TP_SOFT_CAP, STRAT.TP_R * r) : STRAT.TP_SOFT_CAP;
+    return { slPct: r, tpPct: tp, rPct: r, source: 'fixe-' + (r * 100).toFixed(0) + '%' };
   }
   if (a && a > 0) {
     const r = STRAT.ATR_SL_MULT * a;
@@ -2477,6 +2557,17 @@ async function tryOpen(symbol, signal) {
   }
   // 3.22 FUSION : note minimum d'entree (45, et 55 en RANGE). Sans ce seuil, le
   // bot ouvrait a Q=16 (journal live 19/09) : aucun seuil n'existait avant.
+  // 3.31 BIAIS MARCHE (loterie exclue : compteur et logique a part, decret).
+  if (!signal.bonus && STRAT.BIAS_MODE !== 'off' && state.marketBull !== null) {
+    if (!state.marketBull && STRAT.BIAS_MODE === 'pause') {
+      logSkip(S, symbol, `marche BAISSIER (BTC < EMA${STRAT.MARKET_EMA_SPAN}) — aucune entree en mode '${STRAT.BIAS_MODE}'`);
+      return;
+    }
+    if (signal.side === 'SELL') {
+      logSkip(S, symbol, `SHORT refuse — biais marche '${STRAT.BIAS_MODE}' (les shorts ont coute -472$ sur juil-sept 2026)`);
+      return;
+    }
+  }
   if (!signal.bonus) {
     const _qmin = (S.swing && S.swing.regime === 'RANGE') ? STRAT.Q_MIN_ENTRY_RANGE : STRAT.Q_MIN_ENTRY;
     if ((signal.quality || 0) < _qmin) {
@@ -3207,8 +3298,9 @@ function managePosition(symbol) {
     }
   }
 
-  // 4) Borne haute de sécurité (rarement atteinte)
-  if (pnlPct >= STRAT.TP_SOFT_CAP) { closePos(symbol, 'TAKE-PROFIT'); return; }
+  // 4) Borne haute : le TP de la position (3.31 : TP_R x R), repli sur le plafond absolu.
+  const _tpSoft = pos.tpPct || STRAT.TP_SOFT_CAP;
+  if (pnlPct >= _tpSoft) { closePos(symbol, 'TAKE-PROFIT'); return; }
   // Time-stop révisé (backtest) : le time-stop "stagnant" est DÉSACTIVÉ (0 = le SL seul gère) ;
   // un trade qui travaille (trailing armé) est borné à 24h pour laisser courir les gagnants.
   const trailingArmed = STRAT.SL_MODE === 'fixe'
@@ -3690,6 +3782,7 @@ async function refreshAllKlines() {
     const slice = ALL_SYMBOLS.slice(i, i + BATCH);
     await Promise.all(slice.map((s) => refreshKlines(s)));
   }
+  await refreshMarketBias(); // 3.31 : un appel, apres les klines
   rankActiveSymbols();
   if (clients.size) broadcast({ type: 'snapshot', data: snapshot() }); // snapshot construit seulement s'il y a un spectateur
   } finally { refreshAllKlines._busy = false; }
@@ -3806,7 +3899,7 @@ function snapshot() {
     stats: state.stats, winRate: tot ? (state.stats.wins / tot) * 100 : null,
     positions: livePositions(), symbols: symbolsOverview(),
     trades: state.trades.slice(0, 40), log: state.log.slice(0, 50),
-    strat: { sl: STRAT.SL_PCT * 100, trailArm: STRAT.TRAIL_ARM * 100, trailPct: STRAT.TRAIL_PCT * 100, lev: '3-6', universe: state.universe.length, relaxOn: STRAT.RELAX_RANGE_ENTRY, floorOn: STRAT.FLOOR_ENABLED, bonusOn: STRAT.BONUS_ENABLED },
+    strat: { sl: STRAT.SL_PCT * 100, biasMode: STRAT.BIAS_MODE, marketBull: state.marketBull, trailArm: STRAT.TRAIL_ARM * 100, trailPct: STRAT.TRAIL_PCT * 100, lev: '3-6', universe: state.universe.length, relaxOn: STRAT.RELAX_RANGE_ENTRY, floorOn: STRAT.FLOOR_ENABLED, bonusOn: STRAT.BONUS_ENABLED },
     bonusStats: state.bonusStats,
   };
 }
@@ -3960,7 +4053,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
   <div class="head">
     <span class="logo">CryptoSignal<span class="c">AI</span> · Multi</span>
-    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.30 - SWING 25 cryptos · 25 sym · 6 pos <span style="opacity:.6;font-weight:600">· mise 80$ · levier ≤x4 · perte 19-38$</span></span>
+    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.31 - CADENCE · 25 sym · 6 pos <span style="opacity:.6;font-weight:600">· stop 4% · TP 3R · 24h max · biais marché</span></span>
     <span id="mode" class="badge net">TESTNET</span>
     <span id="run" class="badge off">PAUSE</span>
   </div>
@@ -4063,7 +4156,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     if($('toggleRelax'))$('toggleRelax').textContent='🔧 Assoupli: '+(s.strat&&s.strat.relaxOn?'ON':'OFF');
     if($('toggleFloor'))$('toggleFloor').textContent='🎯 Plancher 4/h: '+(s.strat&&s.strat.floorOn?'ON':'OFF');
     if($('toggleBonus')){var bs=s.bonusStats||{count:0,wins:0,losses:0,net:0};$('toggleBonus').textContent='🎰 Bonus: '+(s.strat&&s.strat.bonusOn?'ON':'OFF')+(bs.count?' ('+bs.wins+'W/'+bs.losses+'L '+(bs.net>=0?'+':'')+bs.net.toFixed(0)+'$)':'');}
-    $('stratline').textContent='3.30-SWING 25 cryptos · stop 12% fixe · trailing armé à +12% (+1R) puis −3% du pic · AUCUN partiel · aucune limite de durée · note min 60 · loterie Q≥75, mise ≤50$, stop 15% de la mise · levier x2 (60-69) / x3 (70-78) / x4 (79+) · mise 80$ · perte pleine 19$ à 38$ selon le levier · 6 positions · gel FOMC T−25/T+35';
+    $('stratline').textContent='3.31-CADENCE · stop 4% fixe · TP natif 3R (+12%) · trailing armé à +1R puis −0.25R du pic · durée max 24h · note min 60 · loterie Q≥75 · levier x2 (60-69) / x3 (70-78) / x4 (79+) · mise 80$ · perte pleine 6-13$ · biais marché : longs seuls si BTC > EMA200, pause sinon · plafond volatilité 2%/h · 6 positions · gel FOMC T−25/T+35 · backtest juil-sept 2026 : 194 trades, durée moyenne 19h';
       if($('connInfo')){
         // 3.14e : "Connecté" ne signifiait que "clé reçue". Si Binance la REFUSE,
         // on le dit en rouge — c'est une panne totale, pas un detail.
@@ -4262,8 +4355,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // DÉMARRAGE
 // ==================================================================
 async function start() {
-  logLine(`\u{1F680} Itachi — SERVEUR 3.30-SWING 25 CRYPTOS (mise 80$ / levier <=x4 / perte 19-38$ / fix stop 12% reel / volatilite <=2%/h / note min 60 / loterie Q75 mise<=50$ stop 15% de la mise / levier x2-x7 selon note / stop 12% / TP 12% puis on laisse courir / mise 100$ / zero partiel / note min 45-55 / plafond volatilite 2%/h / 8 positions / loterie Q70+ 20-50$ x8-20 / grosses mises x3-5 / fix investi partiel / gel FOMC 25/35 / partiel +1R / gagnants 48h / levier x3-6 / mise indexee sur Q : Q>=80 200$ x3-5 proportionnelle au palier, Q<60 x0.5 / plancher OFF / gel FOMC / reserve de marge pour les hauts Q / pleine mise 110-170$ puis residuelles 30/20/10$ / 10 slots / univers 90 / post-mortem par trade / trail post-partiel 1R : le break-even redevient le plancher / tickSize / prix d'entree REEL / respect du ban IP / precisions garanties / autotest de connexion / zero cooldown sur panne d'auth / nettoyage cles / palier 1 supprime / palier affiche / chien de garde stop natif / anti-fantomes : confirmation 2x + age min 20s + verrou d'entree + P&L reel Binance — decret Calvin 03/09) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
-  logLine(`\u{1F4C8} 3.30-SWING — LOTERIE Q>=${STRAT.BONUS_MIN_Q} ${STRAT.BONUS_STAKE_MIN_USD}-${STRAT.BONUS_STAKE_MAX_USD}$ x${STRAT.BONUS_LEV_MIN}-${STRAT.BONUS_LEV_MAX} — partiel RANGE +${STRAT.RANGE_PARTIAL_AT_R}R — gagnants ${STRAT.TIME_STOP_WORKING_MS / 3600000}h — MISE Q : Q>=${STRAT.Q_BOOST} -> ${STRAT.BOOST_REF_STAKE}$ au palier 1 (x${STRAT.BOOST_LEV_MIN}-${STRAT.BOOST_LEV_MAX}), Q<${STRAT.Q_WEAK} -> x${STRAT.WEAK_STAKE_FRAC} — plancher ${STRAT.FLOOR_ENABLED ? 'ON' : 'OFF'} — gel macro ${STRAT.MACRO_EVENTS.length} evenement(s) — RESERVE : ${STRAT.PREMIUM_RESERVE_SLOTS} pleine(s) mise(s) gardee(s) pour les signaux Q\u2265${STRAT.Q_PREMIUM} (reserve decroissante : elle fond des qu'une position premium s'ouvre) — 10 slots : PLEINE mise de palier (110-170$) tant que la marge suit, puis mises RESIDUELLES ${STRAT.RESIDUAL_STAKES.join('/')}$ selon la marge restante (garde MIN_NOTIONAL active) — univers ${STRAT.CORE_SYMBOLS.length + STRAT.DYNAMIC_SIZE} cryptos — colonne ANALYSE (post-mortem automatique par trade, aussi dans /stats.csv) — trailing post-partiel 1.0R (au lieu de 0.5R) : le plancher redevient le BREAK-EVEN, les gagnants disposent d'un R entier de respiration — risque inchange — prix/quantites cales sur tickSize et stepSize (fin du -1111 sur les stops) — entry lu sur le FILL REEL Binance (fin des STOP-1R instantanes) — ban IP respecte a la seconde — precisions Binance obligatoires avant toute ouverture (fin du -1111) + rechargement automatique — autotest de connexion (verdict immediat + cause exacte) — aucune ouverture ni cooldown tant que Binance refuse les cles — cles API nettoyees (NFKC + ASCII imprimable seul : fin du -2014) + alerte rouge si Binance refuse — paliers de mise : palier 1 (50-100$) SUPPRIME, plancher a 100-175$ — chien de garde stop natif (re-pose 1x/min si position nue) — anti-fantomes : une fermeture native exige 2 absences consecutives de positionRisk + 20s d'age + aucune entree en vol ; P&L lu sur /fapi/v1/userTrades — partiel : RANGE +1R / tendance +1R / volatil +0.4R — bonus : partiel +15% puis break-even, verrou 6h apres perte — prises partielles enregistrees dans l'historique et /stats.csv — filtre carnet 3:1 — cap 8 positions`);
+  logLine(`\u{1F680} Itachi — SERVEUR 3.31-CADENCE (stop 4% / TP natif 3R / duree max 24h / biais marche EMA200 BTC / mise 80$ / levier <=x4 / fix stop 12% reel / volatilite <=2%/h / note min 60 / loterie Q75 mise<=50$ stop 15% de la mise / levier x2-x7 selon note / stop 12% / TP 12% puis on laisse courir / mise 100$ / zero partiel / note min 45-55 / plafond volatilite 2%/h / 8 positions / loterie Q70+ 20-50$ x8-20 / grosses mises x3-5 / fix investi partiel / gel FOMC 25/35 / partiel +1R / gagnants 48h / levier x3-6 / mise indexee sur Q : Q>=80 200$ x3-5 proportionnelle au palier, Q<60 x0.5 / plancher OFF / gel FOMC / reserve de marge pour les hauts Q / pleine mise 110-170$ puis residuelles 30/20/10$ / 10 slots / univers 90 / post-mortem par trade / trail post-partiel 1R : le break-even redevient le plancher / tickSize / prix d'entree REEL / respect du ban IP / precisions garanties / autotest de connexion / zero cooldown sur panne d'auth / nettoyage cles / palier 1 supprime / palier affiche / chien de garde stop natif / anti-fantomes : confirmation 2x + age min 20s + verrou d'entree + P&L reel Binance — decret Calvin 03/09) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
+  logLine(`\u{1F4C8} 3.31-CADENCE — LOTERIE Q>=${STRAT.BONUS_MIN_Q} ${STRAT.BONUS_STAKE_MIN_USD}-${STRAT.BONUS_STAKE_MAX_USD}$ x${STRAT.BONUS_LEV_MIN}-${STRAT.BONUS_LEV_MAX} — partiel RANGE +${STRAT.RANGE_PARTIAL_AT_R}R — gagnants ${STRAT.TIME_STOP_WORKING_MS / 3600000}h — MISE Q : Q>=${STRAT.Q_BOOST} -> ${STRAT.BOOST_REF_STAKE}$ au palier 1 (x${STRAT.BOOST_LEV_MIN}-${STRAT.BOOST_LEV_MAX}), Q<${STRAT.Q_WEAK} -> x${STRAT.WEAK_STAKE_FRAC} — plancher ${STRAT.FLOOR_ENABLED ? 'ON' : 'OFF'} — gel macro ${STRAT.MACRO_EVENTS.length} evenement(s) — RESERVE : ${STRAT.PREMIUM_RESERVE_SLOTS} pleine(s) mise(s) gardee(s) pour les signaux Q\u2265${STRAT.Q_PREMIUM} (reserve decroissante : elle fond des qu'une position premium s'ouvre) — 10 slots : PLEINE mise de palier (110-170$) tant que la marge suit, puis mises RESIDUELLES ${STRAT.RESIDUAL_STAKES.join('/')}$ selon la marge restante (garde MIN_NOTIONAL active) — univers ${STRAT.CORE_SYMBOLS.length + STRAT.DYNAMIC_SIZE} cryptos — colonne ANALYSE (post-mortem automatique par trade, aussi dans /stats.csv) — trailing post-partiel 1.0R (au lieu de 0.5R) : le plancher redevient le BREAK-EVEN, les gagnants disposent d'un R entier de respiration — risque inchange — prix/quantites cales sur tickSize et stepSize (fin du -1111 sur les stops) — entry lu sur le FILL REEL Binance (fin des STOP-1R instantanes) — ban IP respecte a la seconde — precisions Binance obligatoires avant toute ouverture (fin du -1111) + rechargement automatique — autotest de connexion (verdict immediat + cause exacte) — aucune ouverture ni cooldown tant que Binance refuse les cles — cles API nettoyees (NFKC + ASCII imprimable seul : fin du -2014) + alerte rouge si Binance refuse — paliers de mise : palier 1 (50-100$) SUPPRIME, plancher a 100-175$ — chien de garde stop natif (re-pose 1x/min si position nue) — anti-fantomes : une fermeture native exige 2 absences consecutives de positionRisk + 20s d'age + aucune entree en vol ; P&L lu sur /fapi/v1/userTrades — partiel : RANGE +1R / tendance +1R / volatil +0.4R — bonus : partiel +15% puis break-even, verrou 6h apres perte — prises partielles enregistrees dans l'historique et /stats.csv — filtre carnet 3:1 — cap 8 positions`);
   if (!API_KEY || !API_SECRET) logLine('\u26A0\uFE0F Aucune cle — choisis TESTNET/MAINNET dans le dashboard, colle tes cles et clique 🔐 Connecter.');
   else logLine(`🔐 Cles trouvees en variables d'environnement — mode ${MODE.toUpperCase()} pre-connecte (reconnexion auto post-redeploiement).`);
 
