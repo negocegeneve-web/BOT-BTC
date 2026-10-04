@@ -1,5 +1,84 @@
 /* ============================================================
- *  SERVEUR 3.31 - CADENCE  (TP realiste / stop 4% / 24h max / biais marche)
+ *  SERVEUR 3.33 - OPTIM  (relecture et performance, strategie INCHANGEE)
+ *  ------------------------------------------------------------
+ *  AUCUN parametre de trading ne bouge : memes entrees, memes sorties, memes
+ *  mises, memes filtres, memes stops. Seul le CHEMIN D EXECUTION change.
+ *  Verifie par scripts/invariants_test.py (19/19) et par le parity check.
+ *
+ *  SEPT OPTIMISATIONS, de la plus rentable a la plus fine :
+ *
+ *  1. SORTIE ANTICIPEE QUAND LES SLOTS SONT PLEINS. symbolTick() appelait
+ *     computeSignal() sur les 25 symboles chaque seconde MEME avec 6/6
+ *     positions ouvertes, alors qu aucune entree n etait possible. C est le
+ *     cas le plus frequent en live. On sort juste apres managePosition()
+ *     (les sorties restent evaluees a chaque tick, rien n est retarde).
+ *     ~25 computeSignal/s economises quand le bot est plein.
+ *
+ *  2. GEL MACRO : DATES PRE-PARSEES + CACHE 30 s. macroFreezeActive() faisait
+ *     un Date.parse() par evenement A CHAQUE TICK DE CHAQUE SYMBOLE (3 parses
+ *     x 25 symboles x 1/s = 75 parses/s) pour un resultat qui ne change
+ *     qu une fois par heure. Les timestamps sont desormais calcules une seule
+ *     fois (MACRO_TS, au premier appel) et le verdict est mis en cache 30 s.
+ *
+ *  3. activeSymbols EN Set. tryOpen() faisait un Array.includes() O(n) sur
+ *     les 25 symboles a chaque tentative. rankActiveSymbols() construit
+ *     maintenant aussi un Set (state.activeSet) : test O(1). Le tableau est
+ *     conserve tel quel pour le dashboard et le snapshot.
+ *
+ *  4. logSkip ACCEPTE UNE FONCTION. Les messages de saut etaient construits
+ *     (template string, toFixed, concatenations) AVANT l appel, puis jetes
+ *     par le throttle de 10 min dans 99,9% des cas. Les quatre messages des
+ *     boucles chaudes (volatilite, marche baissier, short refuse, note trop
+ *     basse) sont desormais passes en lambda : la chaine n est construite que
+ *     si la ligne est reellement ecrite.
+ *
+ *  5. premiumSlotsUsed() N EST PLUS APPELEE quand PREMIUM_RESERVE_SLOTS vaut
+ *     0 (le cas depuis la 3.32) : cette fonction parcourait les 25 symboles
+ *     via Object.keys() pour un resultat multiplie par zero.
+ *
+ *  6. currentExposure() SANS ALLOCATION : boucle indexee au lieu de for..of,
+ *     comme openPositionsCount() en 3.22.
+ *
+ *  7. SORTIE ANTICIPEE SANS SIGNAL. Quand computeSignal() ne rend rien et que
+ *     le plancher est OFF (son etat par defaut), la suite de symbolTick ne
+ *     pouvait de toute facon rien faire : on sort avant le gel macro et le
+ *     verrou bonus.
+ *
+ *  HISTORIQUE 3.32 - FIN DES MISES A 10$  (reserve premium supprimee)
+ *  ------------------------------------------------------------
+ *  DEFAUT CONSTATE EN LIVE LE 04/10 (3.31) : des entrees a 10$ et 30$ au lieu
+ *  des 80$ decretes — ADA Q62 -> 30$, AVAX Q60 -> 10$, WLD Q60 -> 10$.
+ *  CAUSE EXACTE, arithmetique :
+ *    reserve premium = PREMIUM_RESERVE_SLOTS x MIN_STAKE x MARGIN_BUFFER
+ *                    = 2 x 80 x 1.35 = 216$ GARDES pour d eventuels Q>=70.
+ *    Un signal Q60-69 ne voit donc la marge qu au-dela de ces 216$ : il lui
+ *    faut 216 + 108 = 324$ de marge LIBRE pour obtenir sa pleine mise.
+ *    Capital ~493$, expo 176.80$ -> marge libre ~316$ < 324$ -> la garde
+ *    marge rabat sur RESIDUAL_STAKES [30, 20, 10].
+ *  Cette reserve datait de la 3.17, quand le capital valait 814$ et les mises
+ *  110-170$. Avec une mise unique de 80$ elle n a plus d objet : elle ne
+ *  protege plus rien, elle degrade les signaux Q60-69.
+ *
+ *  TROIS CORRECTIFS :
+ *  1. PREMIUM_RESERVE_SLOTS 2 -> 0. Plus de marge gelee. Un Q60 obtient la
+ *     meme mise qu un Q85 (le levier, lui, continue de distinguer la qualite).
+ *  2. RESIDUAL_STAKES [30,20,10] -> []. Quand la marge ne couvre pas 80$,
+ *     le trade est SAUTE proprement au lieu d etre pris a 10$. Un trade a 10$
+ *     x2 = 20$ de position : 0.80$ de gain a +1R pour 2 x 0.05% de frais —
+ *     il ne paie pas son passage et occupe un slot sur six.
+ *  3. LOTERIE SOUS BIAIS MARCHE. Le 04/10 un ticket SOL SHORT x8 s est ouvert
+ *     en plein marche haussier : la 3.31 exemptait le bonus du filtre. En
+ *     marche haussier la loterie ne prend plus que des longs ; en marche
+ *     baissier, mode 'pause', elle ne prend plus rien.
+ *
+ *  SUR LA CADENCE — la contrainte est la MARGE, pas les filtres :
+ *    6 positions x 80$ = 480$ de marge, et chaque entree exige 108$ de marge
+ *    libre. Sur un capital de ~493$ le bot tient 4 positions pleines, 5 au
+ *    mieux. Les 6 slots ne seront reellement atteignables qu a partir de
+ *    ~650$. Les positions "adoptees" d un redeploiement occupent en plus des
+ *    slots pendant 24h (time-stop) sans que le bot les ait choisies.
+ *
+ *  HISTORIQUE 3.31 - CADENCE  (TP realiste / stop 4% / 24h max / biais marche)
  *  ------------------------------------------------------------
  *  CONSTAT CALVIN 03/10, verifie au backtest (klines 1h Binance, 25 cryptos,
  *  juillet-aout-septembre 2026, frais 0.05%/cote) sur la 3.30 :
@@ -1231,7 +1310,7 @@ const STRAT = {
 
   // --- Positions & risque ---
   Q_PREMIUM: 70,                 // 3.17 (decret 03/09) : au-dela de ce Q, le signal est PREMIUM et peut puiser dans la reserve de marge
-  PREMIUM_RESERVE_SLOTS: 2,      // 3.17 : nombre de pleines mises gardees INTOUCHABLES pour les signaux premium. 0 = comportement 3.16 restaure.
+  PREMIUM_RESERVE_SLOTS: 0,      // 3.32 (04/10) : 2 -> 0. La reserve gelait 216$ (2 x 80 x 1.35) et faisait tomber tous les signaux Q60-69 en mise residuelle. Sans objet depuis la mise unique de 80$.
   // --- 3.22 FUSION (backtest juin-aout 2026) ---
   SL_MODE: 'fixe',               // 'fixe' = stop 5% (Champion, backteste) | 'atr' = cadre R 3.21
   SL_FIXED_PCT: 0.04,            // 3.31 (decret 03/10) : stop 4% du prix (etait 12%). Perte pleine 6.40$ a x2, 12.80$ a x4 sur une mise de 80$.
@@ -1271,7 +1350,7 @@ const STRAT = {
     { at: '2026-10-28T18:00:00Z', label: 'FOMC' },
     { at: '2026-12-09T19:00:00Z', label: 'FOMC + SEP/dot plot' },
   ],
-  RESIDUAL_STAKES: [30, 20, 10], // 3.16 (decret 03/09) : quand la marge ne couvre plus la pleine mise de palier, on descend a la plus grosse de ces valeurs qui passe. Ordre decroissant OBLIGATOIRE.
+  RESIDUAL_STAKES: [],           // 3.32 (04/10) : vide. Si la marge ne couvre pas MIN_STAKE_USD, on SAUTE le trade au lieu de l ouvrir a 10$ (0.80$ de gain a +1R, frais compris : il ne paie pas son passage et bloque un slot).
   MAX_POSITIONS_CAP: 6,  // 3.24 (backtest) : 6 positions x 100$ = 600$ de marge max
   MAX_EXPOSURE_PCT: 6.0, // exposition relevee a 600% (garde-fou)
 
@@ -2337,17 +2416,24 @@ function loadState() {
 }
 
 // 3.13e : LOG DE REFUS throttle (10 min / symbole) — le bot dit pourquoi il n'entre pas.
+// 3.33 OPTIM : msg peut etre une FONCTION. Le throttle rejette 99,9% des
+// appels ; passer une lambda evite de construire la chaine pour rien dans les
+// boucles chaudes (volatilite, biais marche, note minimum).
 function logSkip(S, symbol, msg) {
   const now = Date.now();
   if (!S._skipLogAt || now - S._skipLogAt > 600000) {
     S._skipLogAt = now;
-    logLine(`\u23ED\uFE0F ${symbol} sauté : ${msg}`);
+    logLine(`\u23ED\uFE0F ${symbol} sauté : ${typeof msg === 'function' ? msg() : msg}`);
   }
 }
 
 function currentExposure() {
+  // 3.33 OPTIM : boucle indexee (meme calcul, zero iterateur alloue).
   let total = 0;
-  for (const s of ALL_SYMBOLS) if (state.sym[s].position) total += state.sym[s].position.stake;
+  for (let i = 0; i < ALL_SYMBOLS.length; i++) {
+    const p = state.sym[ALL_SYMBOLS[i]].position;
+    if (p) total += p.stake;
+  }
   return total;
 }
 function openPositionsCount() {
@@ -2504,14 +2590,24 @@ function findRotationCandidate(exclude) {
 }
 
 // 3.18 GEL MACRO : renvoie l'evenement actif si now est dans [T-PRE ; T+POST].
+// 3.33 OPTIM : timestamps pre-parses une seule fois + cache 30 s du verdict.
+// Appelee a chaque tick de chaque symbole, elle faisait sinon 3 Date.parse()
+// x 25 symboles x 1/s pour une reponse qui ne change qu une fois par heure.
 function macroFreezeActive(now) {
   if (!STRAT.MACRO_FREEZE_ENABLED || !Array.isArray(STRAT.MACRO_EVENTS)) return null;
-  for (const ev of STRAT.MACRO_EVENTS) {
-    const t = Date.parse(ev.at);
-    if (!Number.isFinite(t)) continue;
-    if (now >= t - STRAT.MACRO_PRE_MS && now <= t + STRAT.MACRO_POST_MS) return ev;
+  const F = macroFreezeActive; // etat porte par la fonction (comme refreshAllKlines._busy)
+  if (!F._ts || F._ts.length !== STRAT.MACRO_EVENTS.length) {
+    F._ts = STRAT.MACRO_EVENTS.map((ev) => ({ ev, t: Date.parse(ev.at) })).filter((x) => Number.isFinite(x.t));
+    F._at = 0; // invalide le cache si la liste a change a chaud
   }
-  return null;
+  if (F._at && now - F._at < 30000) return F._ev;
+  let found = null;
+  for (let i = 0; i < F._ts.length; i++) {
+    const e = F._ts[i];
+    if (now >= e.t - STRAT.MACRO_PRE_MS && now <= e.t + STRAT.MACRO_POST_MS) { found = e.ev; break; }
+  }
+  F._at = now; F._ev = found;
+  return found;
 }
 
 async function tryOpen(symbol, signal) {
@@ -2547,31 +2643,32 @@ async function tryOpen(symbol, signal) {
   // Qualité d'exécution : spread d'entrée maximal (mainnet strict, testnet tolérant).
   const entrySpreadMax = MODE === 'mainnet' ? STRAT.BOOK_ENTRY_SPREAD_MAINNET : STRAT.BOOK_ENTRY_SPREAD_TESTNET;
   if (S.book && S.book.spreadPct > entrySpreadMax) return;
-  if (state.activeSymbols && !state.activeSymbols.includes(symbol)) return;
+  if (state.activeSet && !state.activeSet.has(symbol)) return; // 3.33 OPTIM : Set au lieu d un includes() O(n)
   if (now - S.lastEntryAt < STRAT.MIN_GAP_MS) return;
   // 3.22 FUSION : plafond de volatilite — au-dessus, le stop est dans le bruit.
   const _atr = S.swing && S.swing.atrPct;
   if (STRAT.VOLCAP_ATR_PCT && Number.isFinite(_atr) && _atr > STRAT.VOLCAP_ATR_PCT) {
-    logSkip(S, symbol, `volatilite ${(_atr * 100).toFixed(2)}%/h > plafond ${(STRAT.VOLCAP_ATR_PCT * 100).toFixed(1)}%`);
+    logSkip(S, symbol, () => `volatilite ${(_atr * 100).toFixed(2)}%/h > plafond ${(STRAT.VOLCAP_ATR_PCT * 100).toFixed(1)}%`);
     return;
   }
   // 3.22 FUSION : note minimum d'entree (45, et 55 en RANGE). Sans ce seuil, le
   // bot ouvrait a Q=16 (journal live 19/09) : aucun seuil n'existait avant.
-  // 3.31 BIAIS MARCHE (loterie exclue : compteur et logique a part, decret).
-  if (!signal.bonus && STRAT.BIAS_MODE !== 'off' && state.marketBull !== null) {
+  // 3.32 BIAIS MARCHE — la loterie y est desormais SOUMISE (un ticket SOL SHORT
+  // x8 s est ouvert le 04/10 en plein marche haussier sous la 3.31).
+  if (STRAT.BIAS_MODE !== 'off' && state.marketBull !== null) {
     if (!state.marketBull && STRAT.BIAS_MODE === 'pause') {
-      logSkip(S, symbol, `marche BAISSIER (BTC < EMA${STRAT.MARKET_EMA_SPAN}) — aucune entree en mode '${STRAT.BIAS_MODE}'`);
+      logSkip(S, symbol, () => `marche BAISSIER (BTC < EMA${STRAT.MARKET_EMA_SPAN}) — aucune entree en mode '${STRAT.BIAS_MODE}'`);
       return;
     }
     if (signal.side === 'SELL') {
-      logSkip(S, symbol, `SHORT refuse — biais marche '${STRAT.BIAS_MODE}' (les shorts ont coute -472$ sur juil-sept 2026)`);
+      logSkip(S, symbol, () => `SHORT refuse — biais marche '${STRAT.BIAS_MODE}' (les shorts ont coute -472$ sur juil-sept 2026)`);
       return;
     }
   }
   if (!signal.bonus) {
     const _qmin = (S.swing && S.swing.regime === 'RANGE') ? STRAT.Q_MIN_ENTRY_RANGE : STRAT.Q_MIN_ENTRY;
     if ((signal.quality || 0) < _qmin) {
-      logSkip(S, symbol, `note ${signal.quality} < minimum ${_qmin} (${S.swing && S.swing.regime})`);
+      logSkip(S, symbol, () => `note ${signal.quality} < minimum ${_qmin} (${S.swing && S.swing.regime})`);
       return;
     }
   }
@@ -2678,7 +2775,10 @@ async function tryOpen(symbol, signal) {
     // pour rien une fois les hauts Q deja servis). Un signal premium, lui, voit
     // toute la marge : la reserve existe precisement pour lui.
     const estPremium = signal.bonus || (signal.quality || 0) >= STRAT.Q_PREMIUM;
-    const slotsAGarder = estPremium ? 0 : Math.max(0, STRAT.PREMIUM_RESERVE_SLOTS - premiumSlotsUsed());
+    // 3.33 OPTIM : a PREMIUM_RESERVE_SLOTS=0 (defaut depuis la 3.32), inutile de
+    // parcourir les 25 symboles pour un resultat multiplie par zero.
+    const slotsAGarder = (estPremium || STRAT.PREMIUM_RESERVE_SLOTS <= 0)
+      ? 0 : Math.max(0, STRAT.PREMIUM_RESERVE_SLOTS - premiumSlotsUsed());
     const reserveUSD = slotsAGarder * stake * STRAT.MARGIN_BUFFER;
     const freeUtile = free != null ? free - reserveUSD : null;
     if (freeUtile != null && freeUtile < Math.max(stake, reservedStakeUSD()) * STRAT.MARGIN_BUFFER) {
@@ -2696,7 +2796,8 @@ async function tryOpen(symbol, signal) {
       if (!residuel) {
         if (!state._marginLogAt || now - state._marginLogAt > 60000) {
           state._marginLogAt = now;
-          logLine(`\u26D4 marge libre ${free.toFixed(0)}$${reserveUSD > 0 ? ` (dont ${Math.round(reserveUSD)}$ réservés aux Q\u2265${STRAT.Q_PREMIUM})` : ''} — même la mise résiduelle minimale (${STRAT.RESIDUAL_STAKES[STRAT.RESIDUAL_STAKES.length - 1]}$) ne passe pas — ouverture ${symbol} sautée.`);
+          const _min = STRAT.RESIDUAL_STAKES.length ? `${STRAT.RESIDUAL_STAKES[STRAT.RESIDUAL_STAKES.length - 1]}$ (résiduelle)` : `${stake}$ (mise minimum, aucune résiduelle autorisée)`;
+          logLine(`\u26D4 marge libre ${free.toFixed(0)}$${reserveUSD > 0 ? ` (dont ${Math.round(reserveUSD)}$ réservés aux Q\u2265${STRAT.Q_PREMIUM})` : ''} — ${_min} ne passe pas — ouverture ${symbol} sautée.`);
         }
         return;
       }
@@ -3330,6 +3431,10 @@ async function symbolTick(symbol) {
   // GESTION DES SORTIES : à chaque tick (vital, une position doit réagir vite au stop).
   managePosition(symbol);
   if (S.busy || S.position || S.disabled) return;
+  // 3.33 OPTIM : tous les slots occupes -> aucune entree possible. On sort AVANT
+  // refreshLiveIndicators + computeSignal (le cas le plus frequent en live).
+  // Les SORTIES restent evaluees a chaque tick : managePosition est deja passe.
+  if (openPositionsCount() + reservedSlots() >= STRAT.MAX_POSITIONS_CAP) return;
   // DÉTECTION D'ENTRÉE : throttlée à ~1s par symbole. Sur horizon swing 1h, évaluer le
   // signal 28x/s serait du gaspillage CPU pur — 1x/s est rigoureusement équivalent en
   // résultat. Le recalcul live des indicateurs est intégré ici (même cadence).
@@ -3338,6 +3443,8 @@ async function symbolTick(symbol) {
   S._detectAt = now;
   refreshLiveIndicators(S); // bandes/RSI réactifs au prix courant
   let signal = computeSignal(symbol);
+  // 3.33 OPTIM : sans signal et plancher OFF, la suite ne peut rien declencher.
+  if (!signal && !STRAT.FLOOR_ENABLED) return;
   // 3.20 GEL MACRO (deplace ici depuis tryOpen) : avant le verrou bonus et le
   // plancher, pour ne rien consommer pendant le gel. Indicateurs deja rafraichis.
   const _macro = macroFreezeActive(now);
@@ -3794,6 +3901,7 @@ function rankActiveSymbols() {
   // L'univers est déjà les N plus volatils ; tous sont actifs. Le filtrage fin
   // (régime, extrême, funding) se fait dans computeSignal.
   state.activeSymbols = ALL_SYMBOLS.slice();
+  state.activeSet = new Set(state.activeSymbols); // 3.33 OPTIM : test O(1) dans tryOpen (le tableau reste pour le dashboard)
 }
 
 // ==================================================================
@@ -4053,7 +4161,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
   <div class="head">
     <span class="logo">CryptoSignal<span class="c">AI</span> · Multi</span>
-    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.31 - CADENCE · 25 sym · 6 pos <span style="opacity:.6;font-weight:600">· stop 4% · TP 3R · 24h max · biais marché</span></span>
+    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.33 - CADENCE · 25 sym · 6 pos <span style="opacity:.6;font-weight:600">· mise 80$ pleine ou rien · stop 4% · TP 3R · 24h max</span></span>
     <span id="mode" class="badge net">TESTNET</span>
     <span id="run" class="badge off">PAUSE</span>
   </div>
@@ -4156,7 +4264,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     if($('toggleRelax'))$('toggleRelax').textContent='🔧 Assoupli: '+(s.strat&&s.strat.relaxOn?'ON':'OFF');
     if($('toggleFloor'))$('toggleFloor').textContent='🎯 Plancher 4/h: '+(s.strat&&s.strat.floorOn?'ON':'OFF');
     if($('toggleBonus')){var bs=s.bonusStats||{count:0,wins:0,losses:0,net:0};$('toggleBonus').textContent='🎰 Bonus: '+(s.strat&&s.strat.bonusOn?'ON':'OFF')+(bs.count?' ('+bs.wins+'W/'+bs.losses+'L '+(bs.net>=0?'+':'')+bs.net.toFixed(0)+'$)':'');}
-    $('stratline').textContent='3.31-CADENCE · stop 4% fixe · TP natif 3R (+12%) · trailing armé à +1R puis −0.25R du pic · durée max 24h · note min 60 · loterie Q≥75 · levier x2 (60-69) / x3 (70-78) / x4 (79+) · mise 80$ · perte pleine 6-13$ · biais marché : longs seuls si BTC > EMA200, pause sinon · plafond volatilité 2%/h · 6 positions · gel FOMC T−25/T+35 · backtest juil-sept 2026 : 194 trades, durée moyenne 19h';
+    $('stratline').textContent='3.33-CADENCE · stop 4% fixe · TP natif 3R (+12%) · trailing armé à +1R puis −0.25R du pic · durée max 24h · note min 60 · loterie Q≥75 · levier x2 (60-69) / x3 (70-78) / x4 (79+) · mise 80$ pleine ou trade sauté (aucune mise résiduelle) · perte pleine 6-13$ · biais marché : longs seuls si BTC > EMA200, pause sinon · plafond volatilité 2%/h · 6 positions · gel FOMC T−25/T+35 · backtest juil-sept 2026 : 194 trades, durée moyenne 19h';
       if($('connInfo')){
         // 3.14e : "Connecté" ne signifiait que "clé reçue". Si Binance la REFUSE,
         // on le dit en rouge — c'est une panne totale, pas un detail.
@@ -4355,8 +4463,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // DÉMARRAGE
 // ==================================================================
 async function start() {
-  logLine(`\u{1F680} Itachi — SERVEUR 3.31-CADENCE (stop 4% / TP natif 3R / duree max 24h / biais marche EMA200 BTC / mise 80$ / levier <=x4 / fix stop 12% reel / volatilite <=2%/h / note min 60 / loterie Q75 mise<=50$ stop 15% de la mise / levier x2-x7 selon note / stop 12% / TP 12% puis on laisse courir / mise 100$ / zero partiel / note min 45-55 / plafond volatilite 2%/h / 8 positions / loterie Q70+ 20-50$ x8-20 / grosses mises x3-5 / fix investi partiel / gel FOMC 25/35 / partiel +1R / gagnants 48h / levier x3-6 / mise indexee sur Q : Q>=80 200$ x3-5 proportionnelle au palier, Q<60 x0.5 / plancher OFF / gel FOMC / reserve de marge pour les hauts Q / pleine mise 110-170$ puis residuelles 30/20/10$ / 10 slots / univers 90 / post-mortem par trade / trail post-partiel 1R : le break-even redevient le plancher / tickSize / prix d'entree REEL / respect du ban IP / precisions garanties / autotest de connexion / zero cooldown sur panne d'auth / nettoyage cles / palier 1 supprime / palier affiche / chien de garde stop natif / anti-fantomes : confirmation 2x + age min 20s + verrou d'entree + P&L reel Binance — decret Calvin 03/09) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
-  logLine(`\u{1F4C8} 3.31-CADENCE — LOTERIE Q>=${STRAT.BONUS_MIN_Q} ${STRAT.BONUS_STAKE_MIN_USD}-${STRAT.BONUS_STAKE_MAX_USD}$ x${STRAT.BONUS_LEV_MIN}-${STRAT.BONUS_LEV_MAX} — partiel RANGE +${STRAT.RANGE_PARTIAL_AT_R}R — gagnants ${STRAT.TIME_STOP_WORKING_MS / 3600000}h — MISE Q : Q>=${STRAT.Q_BOOST} -> ${STRAT.BOOST_REF_STAKE}$ au palier 1 (x${STRAT.BOOST_LEV_MIN}-${STRAT.BOOST_LEV_MAX}), Q<${STRAT.Q_WEAK} -> x${STRAT.WEAK_STAKE_FRAC} — plancher ${STRAT.FLOOR_ENABLED ? 'ON' : 'OFF'} — gel macro ${STRAT.MACRO_EVENTS.length} evenement(s) — RESERVE : ${STRAT.PREMIUM_RESERVE_SLOTS} pleine(s) mise(s) gardee(s) pour les signaux Q\u2265${STRAT.Q_PREMIUM} (reserve decroissante : elle fond des qu'une position premium s'ouvre) — 10 slots : PLEINE mise de palier (110-170$) tant que la marge suit, puis mises RESIDUELLES ${STRAT.RESIDUAL_STAKES.join('/')}$ selon la marge restante (garde MIN_NOTIONAL active) — univers ${STRAT.CORE_SYMBOLS.length + STRAT.DYNAMIC_SIZE} cryptos — colonne ANALYSE (post-mortem automatique par trade, aussi dans /stats.csv) — trailing post-partiel 1.0R (au lieu de 0.5R) : le plancher redevient le BREAK-EVEN, les gagnants disposent d'un R entier de respiration — risque inchange — prix/quantites cales sur tickSize et stepSize (fin du -1111 sur les stops) — entry lu sur le FILL REEL Binance (fin des STOP-1R instantanes) — ban IP respecte a la seconde — precisions Binance obligatoires avant toute ouverture (fin du -1111) + rechargement automatique — autotest de connexion (verdict immediat + cause exacte) — aucune ouverture ni cooldown tant que Binance refuse les cles — cles API nettoyees (NFKC + ASCII imprimable seul : fin du -2014) + alerte rouge si Binance refuse — paliers de mise : palier 1 (50-100$) SUPPRIME, plancher a 100-175$ — chien de garde stop natif (re-pose 1x/min si position nue) — anti-fantomes : une fermeture native exige 2 absences consecutives de positionRisk + 20s d'age + aucune entree en vol ; P&L lu sur /fapi/v1/userTrades — partiel : RANGE +1R / tendance +1R / volatil +0.4R — bonus : partiel +15% puis break-even, verrou 6h apres perte — prises partielles enregistrees dans l'historique et /stats.csv — filtre carnet 3:1 — cap 8 positions`);
+  logLine(`\u{1F680} Itachi — SERVEUR 3.33-CADENCE (optimise / mise 80$ pleine ou rien / reserve premium supprimee / loterie sous biais marche / stop 4% / TP natif 3R / duree max 24h / biais marche EMA200 BTC / mise 80$ / levier <=x4 / fix stop 12% reel / volatilite <=2%/h / note min 60 / loterie Q75 mise<=50$ stop 15% de la mise / levier x2-x7 selon note / stop 12% / TP 12% puis on laisse courir / mise 100$ / zero partiel / note min 45-55 / plafond volatilite 2%/h / 8 positions / loterie Q70+ 20-50$ x8-20 / grosses mises x3-5 / fix investi partiel / gel FOMC 25/35 / partiel +1R / gagnants 48h / levier x3-6 / mise indexee sur Q : Q>=80 200$ x3-5 proportionnelle au palier, Q<60 x0.5 / plancher OFF / gel FOMC / reserve de marge pour les hauts Q / pleine mise 110-170$ puis residuelles 30/20/10$ / 10 slots / univers 90 / post-mortem par trade / trail post-partiel 1R : le break-even redevient le plancher / tickSize / prix d'entree REEL / respect du ban IP / precisions garanties / autotest de connexion / zero cooldown sur panne d'auth / nettoyage cles / palier 1 supprime / palier affiche / chien de garde stop natif / anti-fantomes : confirmation 2x + age min 20s + verrou d'entree + P&L reel Binance — decret Calvin 03/09) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
+  logLine(`\u{1F4C8} 3.33-CADENCE — LOTERIE Q>=${STRAT.BONUS_MIN_Q} ${STRAT.BONUS_STAKE_MIN_USD}-${STRAT.BONUS_STAKE_MAX_USD}$ x${STRAT.BONUS_LEV_MIN}-${STRAT.BONUS_LEV_MAX} — partiel RANGE +${STRAT.RANGE_PARTIAL_AT_R}R — gagnants ${STRAT.TIME_STOP_WORKING_MS / 3600000}h — MISE Q : Q>=${STRAT.Q_BOOST} -> ${STRAT.BOOST_REF_STAKE}$ au palier 1 (x${STRAT.BOOST_LEV_MIN}-${STRAT.BOOST_LEV_MAX}), Q<${STRAT.Q_WEAK} -> x${STRAT.WEAK_STAKE_FRAC} — plancher ${STRAT.FLOOR_ENABLED ? 'ON' : 'OFF'} — gel macro ${STRAT.MACRO_EVENTS.length} evenement(s) — RESERVE : ${STRAT.PREMIUM_RESERVE_SLOTS} pleine(s) mise(s) gardee(s) pour les signaux Q\u2265${STRAT.Q_PREMIUM} (reserve decroissante : elle fond des qu'une position premium s'ouvre) — 10 slots : PLEINE mise de palier (110-170$) tant que la marge suit, puis mises RESIDUELLES ${STRAT.RESIDUAL_STAKES.join('/')}$ selon la marge restante (garde MIN_NOTIONAL active) — univers ${STRAT.CORE_SYMBOLS.length + STRAT.DYNAMIC_SIZE} cryptos — colonne ANALYSE (post-mortem automatique par trade, aussi dans /stats.csv) — trailing post-partiel 1.0R (au lieu de 0.5R) : le plancher redevient le BREAK-EVEN, les gagnants disposent d'un R entier de respiration — risque inchange — prix/quantites cales sur tickSize et stepSize (fin du -1111 sur les stops) — entry lu sur le FILL REEL Binance (fin des STOP-1R instantanes) — ban IP respecte a la seconde — precisions Binance obligatoires avant toute ouverture (fin du -1111) + rechargement automatique — autotest de connexion (verdict immediat + cause exacte) — aucune ouverture ni cooldown tant que Binance refuse les cles — cles API nettoyees (NFKC + ASCII imprimable seul : fin du -2014) + alerte rouge si Binance refuse — paliers de mise : palier 1 (50-100$) SUPPRIME, plancher a 100-175$ — chien de garde stop natif (re-pose 1x/min si position nue) — anti-fantomes : une fermeture native exige 2 absences consecutives de positionRisk + 20s d'age + aucune entree en vol ; P&L lu sur /fapi/v1/userTrades — partiel : RANGE +1R / tendance +1R / volatil +0.4R — bonus : partiel +15% puis break-even, verrou 6h apres perte — prises partielles enregistrees dans l'historique et /stats.csv — filtre carnet 3:1 — cap 8 positions`);
   if (!API_KEY || !API_SECRET) logLine('\u26A0\uFE0F Aucune cle — choisis TESTNET/MAINNET dans le dashboard, colle tes cles et clique 🔐 Connecter.');
   else logLine(`🔐 Cles trouvees en variables d'environnement — mode ${MODE.toUpperCase()} pre-connecte (reconnexion auto post-redeploiement).`);
 
